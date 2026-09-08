@@ -1,0 +1,6 @@
+/target
+*.swp
+*.swo
+.DS_Store
+.agentboard-worktrees
+REVIEW-INSTRUCTIONS.md
