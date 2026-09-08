@@ -33,7 +33,7 @@ ratatui = "0.30.2"
 crossterm = "0.29"
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Utilities
 chrono = "0.4"

@@ -98,21 +98,39 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn configured_command(agent: &str, resume: bool, prompt: Option<&str>) -> String {
-    let cfg = config::load()
+/// Resolve the effective configuration for an agent, falling back to the
+/// built-in defaults if the user configuration is missing or invalid.
+fn resolve_config(agent: &str) -> config::EffectiveConfig {
+    config::load()
         .and_then(|file| config::effective(&file, Some(agent)))
         .unwrap_or_else(|error| {
             eprintln!("warning: ignoring invalid Agentboard configuration: {error}");
             config::effective(&config::FileConfig::default(), Some(agent))
                 .expect("built-in agent configuration must be valid")
-        });
-    let mut args = if resume { cfg.resume_args } else { cfg.args };
+        })
+}
+
+/// Build the shell command string from an already-resolved configuration.
+///
+/// This is pure (no filesystem or environment access), so it can be tested
+/// against a known configuration without depending on the ambient user
+/// configuration file.
+fn format_command(cfg: &config::EffectiveConfig, resume: bool, prompt: Option<&str>) -> String {
+    let mut args = if resume {
+        cfg.resume_args.clone()
+    } else {
+        cfg.args.clone()
+    };
     if let Some(prompt) = prompt {
         args.push(prompt.into());
     }
     let mut parts = vec![shell_quote(&cfg.program)];
     parts.extend(args.iter().map(|arg| shell_quote(arg)));
     parts.join(" ")
+}
+
+fn configured_command(agent: &str, resume: bool, prompt: Option<&str>) -> String {
+    format_command(&resolve_config(agent), resume, prompt)
 }
 
 fn contains_case_insensitive(text: &str, pattern: &str) -> bool {
@@ -238,8 +256,8 @@ mod tests {
 
     #[test]
     fn spawn_command_plain_prompt() {
-        let harness = KiroCliHarness;
-        let cmd = harness.spawn_command("do the thing");
+        let cfg = config::builtin_effective("kiro-cli", "interactive").unwrap();
+        let cmd = wrap_with_exit_marker(&format_command(&cfg, false, Some("do the thing")));
         assert!(cmd.starts_with("'kiro-cli' 'chat' 'do the thing'"));
         assert!(cmd.contains(EXIT_MARKER));
     }
@@ -279,8 +297,9 @@ mod tests {
 
     #[test]
     fn codex_spawn_command_uses_agentboard_worktree_and_full_access_mode() {
-        let harness = CodexHarness;
-        let cmd = harness.spawn_command("implement the feature");
+        let cfg = config::builtin_effective("codex", "interactive").unwrap();
+        let cmd =
+            wrap_with_exit_marker(&format_command(&cfg, false, Some("implement the feature")));
         assert!(cmd.starts_with(
             "'codex' '--cd' '.' '--ask-for-approval' 'on-request' '--sandbox' 'workspace-write'"
         ));
@@ -316,8 +335,8 @@ mod tests {
 
     #[test]
     fn codex_resume_uses_last_session_subcommand() {
-        let harness = CodexHarness;
-        let cmd = harness.resume_command("ignored original prompt");
+        let cfg = config::builtin_effective("codex", "interactive").unwrap();
+        let cmd = wrap_with_exit_marker(&format_command(&cfg, true, None));
         assert!(cmd.starts_with("'codex' 'resume' '--last'"));
         assert!(!cmd.contains("ignored original prompt"));
     }
@@ -331,8 +350,8 @@ mod tests {
 
     #[test]
     fn resume_command_uses_resume_flag() {
-        let harness = KiroCliHarness;
-        let cmd = harness.resume_command("Fix the login bug");
+        let cfg = config::builtin_effective("kiro-cli", "interactive").unwrap();
+        let cmd = wrap_with_exit_marker(&format_command(&cfg, true, None));
         assert!(cmd.contains("'kiro-cli' 'chat' '--resume'"));
         // Should NOT contain the original prompt (--resume loads from .kiro/)
         assert!(!cmd.contains("Fix the login bug"));
@@ -341,10 +360,12 @@ mod tests {
 
     #[test]
     fn start_commands_launch_interactive_agents_without_a_prompt() {
-        let kiro = KiroCliHarness.start_command();
+        let kiro_cfg = config::builtin_effective("kiro-cli", "interactive").unwrap();
+        let kiro = wrap_with_exit_marker(&format_command(&kiro_cfg, false, None));
         assert_eq!(kiro, "'kiro-cli' 'chat'; __ab_ec=$?; echo ''; echo 'AB_AGENT_EXIT:'$__ab_ec; (exit $__ab_ec)");
 
-        let codex = CodexHarness.start_command();
+        let codex_cfg = config::builtin_effective("codex", "interactive").unwrap();
+        let codex = wrap_with_exit_marker(&format_command(&codex_cfg, false, None));
         assert!(codex.starts_with(
             "'codex' '--cd' '.' '--ask-for-approval' 'on-request' '--sandbox' 'workspace-write'"
         ));
