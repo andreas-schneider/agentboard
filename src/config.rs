@@ -198,6 +198,49 @@ fn builtin_config() -> Result<FileConfig> {
     toml::from_str(TEMPLATE).context("built-in configuration is invalid")
 }
 
+/// Resolve the effective configuration for an agent/profile using only the
+/// built-in (shipped) defaults, ignoring any user configuration file.
+///
+/// This is primarily useful for tests that need to assert the exact commands
+/// produced by the shipped defaults without depending on the ambient
+/// `~/.config/agentboard/config.toml`.
+#[cfg(test)]
+pub fn builtin_effective(agent: &str, profile: &str) -> Result<EffectiveConfig> {
+    let builtin = builtin_config()?;
+    let agent_opts = builtin.agents.get(agent).cloned().unwrap_or_default();
+    let profile_opts = builtin
+        .profiles
+        .get(profile)
+        .and_then(|agents| agents.get(agent))
+        .cloned()
+        .unwrap_or_default();
+
+    let args = agent_opts
+        .args
+        .clone()
+        .or_else(|| profile_opts.args.clone())
+        .with_context(|| format!("no arguments configured for agent/profile {agent}/{profile}"))?;
+    let resume_args = agent_opts
+        .resume_args
+        .clone()
+        .or_else(|| profile_opts.resume_args.clone())
+        .with_context(|| {
+            format!("no resume arguments configured for agent/profile {agent}/{profile}")
+        })?;
+    let program = agent_opts
+        .program
+        .or(profile_opts.program)
+        .with_context(|| format!("no program configured for agent/profile {agent}/{profile}"))?;
+
+    Ok(EffectiveConfig {
+        agent: agent.to_owned(),
+        profile: profile.to_owned(),
+        program,
+        args,
+        resume_args,
+    })
+}
+
 pub fn init() -> Result<PathBuf> {
     let path = path().context("cannot determine the user configuration directory")?;
     if path.exists() {
