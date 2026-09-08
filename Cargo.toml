@@ -38,7 +38,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Utilities
 chrono = "0.4"
 anyhow = "1"
-dirs = "6"
+dirs = "7"
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
