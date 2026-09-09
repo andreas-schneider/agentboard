@@ -1,7 +1,12 @@
 # agentboard (`ab`)
 
-Agentboard runs multiple AI coding-agent sessions in parallel. Each task gets
-its own Git worktree and tmux session, managed from a terminal kanban board.
+Agentboard turns scattered terminal sessions into a task-based workflow. It
+connects each agent session to a task and gives you one board to see what is
+queued, running, blocked, or done. From the board, you can start, attach to,
+resume, or message tasks.
+
+Each task gets its own Git worktree and tmux session, so you can work on several
+tasks without losing track of which terminal belongs to what.
 
 ## Setup
 
