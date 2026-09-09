@@ -45,7 +45,12 @@ ab board
 Press `n` to create a task and `Enter` to start it. Agentboard creates the
 worktree, starts the agent, and shows its live progress. Tasks move through
 Backlog, Running, Blocked, and Done; select a task and press `Enter` to start,
-attach, or resume it as appropriate. When entering a session you can scroll with `Ctrl+b [` and leave the scroll mode with `Esc`. You can switch from the session back to the board with `Ctrl+b d`.
+attach, or resume it as appropriate. When entering a session you start in the
+agent window. Each task also has a shell window rooted in the same worktree:
+switch with `Ctrl+b s` (or `Ctrl+b 1`/`p`) and return to the agent with
+`Ctrl+b a` (or `Ctrl+b 0`/`n`). You can scroll with `Ctrl+b [` and leave the
+scroll mode with `Esc`. Switch from the session back to the board with
+`Ctrl+b d`.
 
 Essential controls:
 
