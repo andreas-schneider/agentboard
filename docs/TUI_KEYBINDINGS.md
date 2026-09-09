@@ -46,6 +46,11 @@ sequentially, not simultaneously:
 | `Ctrl+b`, then `d` | Detach from the session and return to the board |
 | `Ctrl+b`, then `[` | Enter tmux copy mode to navigate and inspect session output |
 
+Each task session has two tmux windows: `agent` (window `0`) and `shell`
+(window `1`), both rooted in the task worktree. Use `Ctrl+b`, then `0` or `n`
+to view the agent, and `Ctrl+b`, then `1` or `p` to view the shell. The
+mnemonic shortcuts `Ctrl+b`, then `a` (agent) or `s` (shell) do the same.
+
 Press `q` or `Esc` to leave copy mode.
 
 ## Quick prompts

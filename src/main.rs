@@ -163,8 +163,12 @@ fn main() -> Result<()> {
             println!("┌─────────────────────────────────────────────┐");
             println!("│  Attaching to session '{}'", session);
             println!("│  Detach (return here): Ctrl+B then D        │");
+            println!("│  Switch windows: Ctrl+B then A/S            │");
             println!("│  ⚠ Do NOT press Esc/Ctrl+C (kills agent)    │");
             println!("└─────────────────────────────────────────────┘");
+            if let Some(ref worktree) = task.worktree_path {
+                tmux::ensure_task_windows(session, worktree)?;
+            }
             tmux::attach_session(session)?;
         }
         Commands::Board { repo } => {

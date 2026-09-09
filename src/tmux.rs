@@ -4,10 +4,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+pub const AGENT_WINDOW: &str = "agent";
+pub const SHELL_WINDOW: &str = "shell";
+
 /// Return the tmux session name for a given task id: `ab-<first 8 chars>`.
 pub fn session_name(task_id: &str) -> String {
     let prefix = &task_id[..task_id.len().min(8)];
     format!("ab-{prefix}")
+}
+
+pub fn agent_target(session: &str) -> String {
+    format!("{session}:{AGENT_WINDOW}")
 }
 
 /// Create a detached tmux session in the given working directory.
@@ -19,7 +26,16 @@ pub fn session_name(task_id: &str) -> String {
 /// them if it hasn't finished setting up readline.
 pub fn create_session(session: &str, working_dir: &str) -> Result<()> {
     let output = Command::new("tmux")
-        .args(["new-session", "-d", "-s", session, "-c", working_dir])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-n",
+            AGENT_WINDOW,
+            "-c",
+            working_dir,
+        ])
         .output()
         .context("failed to spawn tmux new-session")?;
 
@@ -31,7 +47,9 @@ pub fn create_session(session: &str, working_dir: &str) -> Result<()> {
     // Wait for the shell inside the new pane to be ready. We poll the
     // visible pane content until a shell prompt appears — that means the
     // shell has fully initialised and is ready to accept send-keys input.
-    wait_for_shell_ready(session)?;
+    wait_for_shell_ready(&agent_target(session))?;
+    create_shell_window(session, working_dir)?;
+    configure_agentboard_bindings()?;
 
     Ok(())
 }
@@ -47,12 +65,12 @@ pub fn create_session(session: &str, working_dir: &str) -> Result<()> {
 /// Now we capture the visible pane content and look for common prompt
 /// indicators (`$`, `#`, `%`, `>`). This ensures the shell has finished
 /// initialisation and is truly waiting for input.
-fn wait_for_shell_ready(session: &str) -> Result<()> {
+fn wait_for_shell_ready(target: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let poll_interval = Duration::from_millis(50);
 
     while Instant::now() < deadline {
-        if let Ok(content) = capture_visible_pane(session) {
+        if let Ok(content) = capture_visible_pane_target(target) {
             // Look for a prompt character at or near the end of the visible
             // content. We check the last non-empty line for common prompt
             // endings: `$ `, `# `, `% `, or `> `.  We also accept these
@@ -80,6 +98,115 @@ fn wait_for_shell_ready(session: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ensure sessions created by older versions gain the named shell window.
+pub fn ensure_task_windows(session: &str, working_dir: &str) -> Result<()> {
+    let output = Command::new("tmux")
+        .args([
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_name}\t#{window_id}",
+        ])
+        .output()
+        .context("failed to list tmux task windows")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux list-windows failed: {stderr}");
+    }
+
+    let mut has_agent = false;
+    let mut has_shell = false;
+    let mut first_window_id = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.splitn(2, '\t');
+        let name = parts.next().unwrap_or_default();
+        let id = parts.next().unwrap_or_default();
+        if first_window_id.is_none() && !id.is_empty() {
+            first_window_id = Some(id.to_string());
+        }
+        has_agent |= name == AGENT_WINDOW;
+        has_shell |= name == SHELL_WINDOW;
+    }
+
+    if !has_agent {
+        let window_id = first_window_id
+            .ok_or_else(|| anyhow::anyhow!("tmux session '{session}' has no windows"))?;
+        let output = Command::new("tmux")
+            .args(["rename-window", "-t", &window_id, AGENT_WINDOW])
+            .output()
+            .context("failed to name the agent tmux window")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux rename-window failed: {stderr}");
+        }
+    }
+
+    if !has_shell {
+        create_shell_window(session, working_dir)?;
+    }
+    configure_agentboard_bindings()?;
+    Ok(())
+}
+
+/// Install mnemonic aliases for the two Agentboard windows while preserving
+/// tmux's normal behavior in other sessions.
+///
+/// tmux key bindings are server-wide, so the fallback commands deliberately
+/// mirror tmux's defaults: `a` sends the prefix through and `s` opens the
+/// session chooser. In an `ab-*` session the keys instead select the named
+/// task windows.
+fn configure_agentboard_bindings() -> Result<()> {
+    let bindings = [
+        ("a", "select-window -t :agent", "send-prefix"),
+        ("s", "select-window -t :shell", "choose-session"),
+    ];
+
+    for (key, agentboard_command, fallback_command) in bindings {
+        let condition = "#{m:ab-*,#{session_name}}";
+        let output = Command::new("tmux")
+            .args([
+                "bind-key",
+                "-T",
+                "prefix",
+                key,
+                "if-shell",
+                "-F",
+                condition,
+                agentboard_command,
+                fallback_command,
+            ])
+            .output()
+            .context("failed to configure tmux window shortcuts")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux bind-key failed: {stderr}");
+        }
+    }
+    Ok(())
+}
+
+fn create_shell_window(session: &str, working_dir: &str) -> Result<()> {
+    let output = Command::new("tmux")
+        .args([
+            "new-window",
+            "-d",
+            "-t",
+            session,
+            "-n",
+            SHELL_WINDOW,
+            "-c",
+            working_dir,
+        ])
+        .output()
+        .context("failed to create tmux shell window")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux new-window failed: {stderr}");
+    }
+    Ok(())
+}
+
 /// Send literal text to a tmux session without pressing Enter.
 ///
 /// Uses `tmux send-keys -l` to disable key-name interpretation, so strings like
@@ -87,8 +214,9 @@ fn wait_for_shell_ready(session: &str) -> Result<()> {
 /// interpreted as special keys. The `--` prevents text starting with `-` from
 /// being parsed as flags.
 pub fn send_text(session: &str, text: &str) -> Result<()> {
+    let target = agent_target(session);
     let output = Command::new("tmux")
-        .args(["send-keys", "-t", session, "-l", "--", text])
+        .args(["send-keys", "-t", &target, "-l", "--", text])
         .output()
         .context("failed to spawn tmux send-keys")?;
 
@@ -120,8 +248,9 @@ pub fn send_command(session: &str, command: &str) -> Result<()> {
 /// Unlike [`send_text`], this does **not** use `-l`, so the argument is
 /// interpreted as a tmux key name.
 fn press_key(session: &str, key: &str) -> Result<()> {
+    let target = agent_target(session);
     let output = Command::new("tmux")
-        .args(["send-keys", "-t", session, key])
+        .args(["send-keys", "-t", &target, key])
         .output()
         .context("failed to spawn tmux send-keys")?;
 
@@ -136,8 +265,9 @@ fn press_key(session: &str, key: &str) -> Result<()> {
 /// Attach to a tmux session, handing control to the user.
 /// Returns when the user detaches (Ctrl+B D).
 pub fn attach_session(session: &str) -> Result<()> {
+    let target = agent_target(session);
     let status = Command::new("tmux")
-        .args(["attach-session", "-t", session])
+        .args(["attach-session", "-t", &target])
         .status()
         .context("failed to spawn tmux attach-session")?;
 
@@ -212,8 +342,9 @@ pub fn wait_for_agent(session: &str, process_name: &str) -> Result<()> {
 /// Capture the last `n` lines of output from a tmux session pane.
 /// Trailing whitespace and blank lines are trimmed.
 pub fn capture_last_lines(session: &str, n: usize) -> Result<String> {
+    let target = agent_target(session);
     let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session, "-p", "-S", &format!("-{n}")])
+        .args(["capture-pane", "-t", &target, "-p", "-S", &format!("-{n}")])
         .output()
         .context("failed to spawn tmux capture-pane")?;
 
@@ -234,8 +365,9 @@ pub fn capture_last_lines(session: &str, n: usize) -> Result<String> {
 /// process tree inspection instead.
 #[allow(dead_code)]
 pub fn pane_current_command(session: &str) -> Result<String> {
+    let target = agent_target(session);
     let output = Command::new("tmux")
-        .args(["list-panes", "-t", session, "-F", "#{pane_current_command}"])
+        .args(["list-panes", "-t", &target, "-F", "#{pane_current_command}"])
         .output()
         .context("failed to spawn tmux list-panes")?;
 
@@ -252,8 +384,9 @@ pub fn pane_current_command(session: &str) -> Result<String> {
 ///
 /// For agentboard sessions this is typically the `kiro-cli-term` process.
 pub fn pane_pid(session: &str) -> Result<u32> {
+    let target = agent_target(session);
     let output = Command::new("tmux")
-        .args(["list-panes", "-t", session, "-F", "#{pane_pid}"])
+        .args(["list-panes", "-t", &target, "-F", "#{pane_pid}"])
         .output()
         .context("failed to spawn tmux list-panes (pane_pid)")?;
 
@@ -393,11 +526,12 @@ pub fn enable_logging(session: &str, log_path: &str) -> Result<()> {
             .with_context(|| format!("failed to create log directory {}", parent.display()))?;
     }
 
+    let target = agent_target(session);
     let output = Command::new("tmux")
         .args([
             "pipe-pane",
             "-t",
-            session,
+            &target,
             "-o",
             &format!("cat >> '{}'", log_path.replace('\'', "'\\''")),
         ])
@@ -671,8 +805,12 @@ pub fn inject_scrollback(session: &str, log_path: &str, max_lines: usize) -> Res
 /// scrollback history). This is more reliable for detecting TUI state than
 /// `capture_last_lines` because it only includes what's actually on screen.
 pub fn capture_visible_pane(session: &str) -> Result<String> {
+    capture_visible_pane_target(&agent_target(session))
+}
+
+fn capture_visible_pane_target(target: &str) -> Result<String> {
     let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session, "-p"])
+        .args(["capture-pane", "-t", target, "-p"])
         .output()
         .context("failed to spawn tmux capture-pane (visible)")?;
 
@@ -697,6 +835,11 @@ mod tests {
     #[test]
     fn session_name_short_id() {
         assert_eq!(session_name("abc"), "ab-abc");
+    }
+
+    #[test]
+    fn agent_target_is_explicitly_named() {
+        assert_eq!(agent_target("ab-12345678"), "ab-12345678:agent");
     }
 
     #[test]

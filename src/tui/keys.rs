@@ -102,6 +102,9 @@ pub fn handle_normal_key(
 
                         if session_alive {
                             let session = task.tmux_session.as_ref().unwrap().clone();
+                            if let Some(ref worktree) = task.worktree_path {
+                                tmux::ensure_task_windows(&session, worktree)?;
+                            }
                             restore_terminal(terminal)?;
                             let _ = tmux::attach_session(&session);
                             enable_raw_mode().context("failed to re-enable raw mode")?;
@@ -135,6 +138,9 @@ pub fn handle_normal_key(
                                     if let Some(ref session) = updated.tmux_session {
                                         if tmux::session_exists(session) {
                                             let session = session.clone();
+                                            if let Some(ref worktree) = updated.worktree_path {
+                                                tmux::ensure_task_windows(&session, worktree)?;
+                                            }
                                             restore_terminal(terminal)?;
                                             let _ = tmux::attach_session(&session);
                                             enable_raw_mode()

@@ -620,6 +620,11 @@ pub fn send_message(store: &TaskStore, task: &Task, message: &str) -> Result<Tas
     if !tmux::session_exists(session) {
         anyhow::bail!("tmux session '{session}' does not exist");
     }
+    if let Some(ref worktree) = task.worktree_path {
+        // Upgrade sessions created before the named agent/shell windows were
+        // introduced, including when messaging directly from the board.
+        tmux::ensure_task_windows(session, worktree)?;
+    }
     let agent_running = tmux::pane_pid(session)
         .map(|pid| {
             !harness.process_name().is_empty()
