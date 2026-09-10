@@ -371,8 +371,22 @@ fn render_detail_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let preview = Paragraph::new(app.detail_lines.as_str())
             .style(Style::default().fg(Color::White))
-            .wrap(Wrap { trim: false })
-            .scroll((app.detail_scroll, 0));
+            .wrap(Wrap { trim: false });
+
+        // The capture contains the newest session output, so the live view
+        // should show its tail by default.  Calculate this after wrapping so
+        // narrow sidebars and terminal resizes still land on the actual last
+        // rendered line.
+        let total_lines = preview.line_count(preview_inner.width);
+        let max_scroll = total_lines
+            .saturating_sub(preview_inner.height as usize)
+            .min(u16::MAX as usize) as u16;
+        let scroll = if app.detail_at_bottom {
+            max_scroll
+        } else {
+            max_scroll.saturating_sub(app.detail_scroll)
+        };
+        let preview = preview.scroll((scroll, 0));
         frame.render_widget(preview, preview_inner);
     }
 }

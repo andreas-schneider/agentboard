@@ -84,10 +84,16 @@ pub fn handle_normal_key(
 
         // Scroll detail panel
         KeyCode::Char(']') => {
-            app.detail_scroll = app.detail_scroll.saturating_add(3);
+            if !app.detail_at_bottom {
+                app.detail_scroll = app.detail_scroll.saturating_sub(3);
+                if app.detail_scroll == 0 {
+                    app.detail_at_bottom = true;
+                }
+            }
         }
         KeyCode::Char('[') => {
-            app.detail_scroll = app.detail_scroll.saturating_sub(3);
+            app.detail_at_bottom = false;
+            app.detail_scroll = app.detail_scroll.saturating_add(3);
         }
 
         // Enter: context-dependent action

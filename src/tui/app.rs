@@ -140,7 +140,10 @@ pub struct App {
 
     // Detail sidebar
     pub detail_lines: String,
+    /// Number of lines to scroll up from the bottom when the user has
+    /// manually moved away from the live tail.
     pub detail_scroll: u16,
+    pub detail_at_bottom: bool,
 
     // Auto-refresh
     pub last_refresh: Instant,
@@ -184,6 +187,7 @@ impl App {
             store,
             detail_lines: String::new(),
             detail_scroll: 0,
+            detail_at_bottom: true,
             last_refresh: now,
             last_detail_capture: now - REFRESH_INTERVAL, // force initial capture
             session_alive: std::collections::HashMap::new(),
@@ -439,6 +443,7 @@ impl App {
             None => String::new(),
         };
         self.detail_scroll = 0;
+        self.detail_at_bottom = true;
     }
 
     // -- Actions (delegate to orchestrator) ---------------------------------
