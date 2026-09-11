@@ -725,6 +725,7 @@ mod tests {
             worktree_path: None,
             branch_name: None,
             tmux_session: None,
+            agent_cli: None,
             created_at: created_at.to_string(),
             updated_at: updated_at.to_string(),
         }
