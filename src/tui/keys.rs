@@ -3,7 +3,7 @@
 use std::io::{self, Stdout};
 
 use anyhow::{Context, Result};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -352,8 +352,8 @@ pub fn handle_normal_key(
 // New task form
 // ---------------------------------------------------------------------------
 
-pub fn handle_new_task_key(app: &mut App, code: KeyCode) -> Result<()> {
-    match code {
+pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
         KeyCode::Esc => {
             app.input_mode = InputMode::Normal;
         }
@@ -379,18 +379,22 @@ pub fn handle_new_task_key(app: &mut App, code: KeyCode) -> Result<()> {
                 };
             }
         }
+        // Ctrl+S has its own terminal control sequence, unlike Ctrl+Enter,
+        // which many terminals encode as an ordinary Enter.
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            submit_new_task(app)?;
+        }
+        KeyCode::Enter if !details_field_is_active(app) => submit_new_task(app)?,
+        // Some terminals or multiplexers do not pass bracketed-paste
+        // sequences through. Treat a plain Enter in Details as text so a
+        // multi-line paste can never create a task mid-paste.
         KeyCode::Enter => {
-            // Extract field values and create task
-            if let InputMode::NewTask { ref fields, .. } = app.input_mode {
-                let title = fields[0].value.trim().to_string();
-                let repo = fields[1].value.trim().to_string();
-                let description = fields[2].value.trim().to_string();
-                if !title.is_empty() {
-                    app.input_mode = InputMode::Normal;
-                    app.create_new_task(&title, &description, &repo)?;
-                } else {
-                    app.notify(Notification::warn("Title cannot be empty"));
-                }
+            if let InputMode::NewTask {
+                ref mut fields,
+                active_field,
+            } = app.input_mode
+            {
+                handle_field_paste(&mut fields[active_field], "\n");
             }
         }
         _ => {
@@ -399,8 +403,37 @@ pub fn handle_new_task_key(app: &mut App, code: KeyCode) -> Result<()> {
                 active_field,
             } = app.input_mode
             {
-                handle_field_key(&mut fields[active_field], code);
+                handle_field_key(&mut fields[active_field], key.code);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Insert a terminal paste into the active New Task form field.
+///
+/// Bracketed paste delivers embedded newlines as text rather than `Enter` key
+/// events, so pasting a multi-line prompt cannot submit the form.
+pub fn handle_new_task_paste(app: &mut App, text: &str) {
+    if let InputMode::NewTask {
+        ref mut fields,
+        active_field,
+    } = app.input_mode
+    {
+        handle_field_paste(&mut fields[active_field], text);
+    }
+}
+
+fn submit_new_task(app: &mut App) -> Result<()> {
+    if let InputMode::NewTask { ref fields, .. } = app.input_mode {
+        let title = fields[0].value.trim().to_string();
+        let repo = fields[1].value.trim().to_string();
+        let description = fields[2].value.trim().to_string();
+        if title.is_empty() {
+            app.notify(Notification::warn("Title cannot be empty"));
+        } else {
+            app.input_mode = InputMode::Normal;
+            app.create_new_task(&title, &description, &repo)?;
         }
     }
     Ok(())
@@ -410,8 +443,8 @@ pub fn handle_new_task_key(app: &mut App, code: KeyCode) -> Result<()> {
 // Edit task form (same field navigation as new task, but saves to existing)
 // ---------------------------------------------------------------------------
 
-pub fn handle_edit_task_key(app: &mut App, code: KeyCode) -> Result<()> {
-    match code {
+pub fn handle_edit_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
         KeyCode::Esc => {
             app.input_mode = InputMode::Normal;
         }
@@ -439,23 +472,21 @@ pub fn handle_edit_task_key(app: &mut App, code: KeyCode) -> Result<()> {
                 };
             }
         }
+        // See New Task: Ctrl+S is a terminal-portable submit key.
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            submit_edit_task(app)?;
+        }
+        KeyCode::Enter if !details_field_is_active(app) => submit_edit_task(app)?,
+        // See the corresponding New Task handler: plain Enter in Details is
+        // content, so unbracketed multi-line pastes remain inside the field.
         KeyCode::Enter => {
             if let InputMode::EditTask {
-                ref task_id,
-                ref fields,
+                ref mut fields,
+                active_field,
                 ..
             } = app.input_mode
             {
-                let task_id = task_id.clone();
-                let title = fields[0].value.trim().to_string();
-                let repo = fields[1].value.trim().to_string();
-                let description = fields[2].value.trim().to_string();
-                if !title.is_empty() {
-                    app.input_mode = InputMode::Normal;
-                    app.edit_task(&task_id, &title, &description, &repo)?;
-                } else {
-                    app.notify(Notification::warn("Title cannot be empty"));
-                }
+                handle_field_paste(&mut fields[active_field], "\n");
             }
         }
         _ => {
@@ -465,8 +496,41 @@ pub fn handle_edit_task_key(app: &mut App, code: KeyCode) -> Result<()> {
                 ..
             } = app.input_mode
             {
-                handle_field_key(&mut fields[active_field], code);
+                handle_field_key(&mut fields[active_field], key.code);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Insert a terminal paste into the active Edit Task form field.
+pub fn handle_edit_task_paste(app: &mut App, text: &str) {
+    if let InputMode::EditTask {
+        ref mut fields,
+        active_field,
+        ..
+    } = app.input_mode
+    {
+        handle_field_paste(&mut fields[active_field], text);
+    }
+}
+
+fn submit_edit_task(app: &mut App) -> Result<()> {
+    if let InputMode::EditTask {
+        ref task_id,
+        ref fields,
+        ..
+    } = app.input_mode
+    {
+        let task_id = task_id.clone();
+        let title = fields[0].value.trim().to_string();
+        let repo = fields[1].value.trim().to_string();
+        let description = fields[2].value.trim().to_string();
+        if title.is_empty() {
+            app.notify(Notification::warn("Title cannot be empty"));
+        } else {
+            app.input_mode = InputMode::Normal;
+            app.edit_task(&task_id, &title, &description, &repo)?;
         }
     }
     Ok(())
@@ -665,6 +729,24 @@ fn handle_field_key(field: &mut InputField, code: KeyCode) {
     }
 }
 
+/// Insert pasted text at the cursor, normalizing terminal line endings for
+/// consistent rendering and storage on every platform.
+fn handle_field_paste(field: &mut InputField, text: &str) {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    field.value.insert_str(field.cursor_pos, &text);
+    field.cursor_pos += text.len();
+}
+
+/// The third form field is the multi-line Details editor.
+fn details_field_is_active(app: &App) -> bool {
+    match &app.input_mode {
+        InputMode::NewTask { active_field, .. } | InputMode::EditTask { active_field, .. } => {
+            *active_field == 2
+        }
+        _ => false,
+    }
+}
+
 /// Find the byte offset of the previous character boundary.
 fn prev_char_boundary(s: &str, pos: usize) -> usize {
     let mut p = pos.saturating_sub(1);
@@ -681,4 +763,28 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
         p += 1;
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_field_paste;
+    use crate::tui::app::InputField;
+
+    #[test]
+    fn paste_inserts_multiline_text_at_cursor_without_losing_unicode() {
+        let mut field = InputField {
+            label: "Details",
+            value: "before after".to_string(),
+            placeholder: "",
+            cursor_pos: "before ".len(),
+        };
+
+        handle_field_paste(&mut field, "first line\r\nsecond 🚀\rthird");
+
+        assert_eq!(field.value, "before first line\nsecond 🚀\nthirdafter");
+        assert_eq!(
+            field.cursor_pos,
+            "before first line\nsecond 🚀\nthird".len()
+        );
+    }
 }
