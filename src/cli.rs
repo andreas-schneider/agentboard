@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 #[command(name = "ab", about = "Agentboard - AI agent task orchestrator")]
 pub struct Cli {
     /// Select the agent CLI for this invocation.
-    #[arg(long, global = true, value_parser = ["kiro-cli", "codex"])]
+    #[arg(long, global = true, value_parser = ["kiro-cli", "codex", "copilot"])]
     pub agent: Option<String>,
 
     /// Select the model for this invocation, overriding configuration.

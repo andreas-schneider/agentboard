@@ -19,6 +19,10 @@ program = "kiro-cli"
 program = "codex"
 # model = "gpt-5-codex"
 
+[agents.copilot]
+program = "copilot"
+# model = "auto"
+
 # The prompt is appended automatically. These are complete argument lists.
 [profiles.interactive.kiro-cli]
 args = ["chat"]
@@ -28,6 +32,10 @@ resume_args = ["chat", "--resume"]
 args = ["--cd", ".", "--ask-for-approval", "on-request", "--sandbox", "workspace-write"]
 resume_args = ["resume", "--last"]
 
+[profiles.interactive.copilot]
+args = ["-C", ".", "--interactive"]
+resume_args = ["-C", ".", "--continue"]
+
 # Use "unattended" only when you explicitly trust the agent and repository.
 [profiles.unattended.kiro-cli]
 args = ["chat", "--trust-all-tools"]
@@ -36,6 +44,12 @@ resume_args = ["chat", "--trust-all-tools", "--resume"]
 [profiles.unattended.codex]
 args = ["--cd", ".", "--ask-for-approval", "never", "--sandbox", "danger-full-access"]
 resume_args = ["resume", "--last"]
+
+[profiles.unattended.copilot]
+# Add "--autopilot" to both lists to let Copilot continue until it completes the task.
+# Keep it opt-in: --no-ask-user only suppresses clarifying questions.
+args = ["-C", ".", "--allow-all", "--no-ask-user", "--interactive"]
+resume_args = ["-C", ".", "--allow-all", "--no-ask-user", "--continue"]
 "#;
 
 #[derive(Debug, Default, Deserialize)]
@@ -275,6 +289,13 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(profile.contains(&"--trust-all-tools".into()));
+
+        let copilot_profile = config.profiles["unattended"]["copilot"]
+            .args
+            .as_ref()
+            .unwrap();
+        assert!(copilot_profile.contains(&"--allow-all".into()));
+        assert!(copilot_profile.contains(&"--no-ask-user".into()));
     }
 
     #[test]

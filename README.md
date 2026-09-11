@@ -13,7 +13,7 @@ tasks without losing track of which terminal belongs to what.
 You need:
 
 - `git`, `tmux`, and a current Rust toolchain
-- A supported agent CLI: `kiro-cli` or `codex`
+- A supported agent CLI: `kiro-cli`, `codex`, or GitHub Copilot CLI (`copilot`)
 - The selected agent CLI authenticated and available on `PATH`
 
 Install Agentboard from a checkout:
@@ -31,7 +31,7 @@ ab config check
 
 This creates `~/.config/agentboard/config.toml` on Linux, using `kiro-cli` and
 the approval-based `interactive` profile by default. Edit `agent` if you want
-to use `codex`. See [Configuration](docs/CONFIGURATION.md) for all options and
+to use `codex` or `copilot`. See [Configuration](docs/CONFIGURATION.md) for all options and
 the complete generated file.
 
 ## Use the board
@@ -76,6 +76,7 @@ when needed:
 ```bash
 ab --agent codex board
 ab --agent codex --model gpt-5.6-luna board
+ab --agent copilot board
 ab --yolo board
 ```
 

@@ -28,7 +28,7 @@ These options may be used with `board`, `start`, and other commands:
 
 | Option | Description |
 |--------|-------------|
-| `--agent <kiro-cli|codex>` | Override the configured agent |
+| `--agent <kiro-cli|codex|copilot>` | Override the configured agent |
 | `--model <model>` | Override the configured model |
 | `--profile <interactive|unattended>` | Override the configured execution profile |
 | `--yolo` | Use the unattended profile; conflicts with `--profile` |
