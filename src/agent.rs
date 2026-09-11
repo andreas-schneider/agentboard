@@ -53,15 +53,23 @@ pub trait AgentHarness {
         &[]
     }
 
+    /// Whether the visible pane shows the agent actively processing a task.
+    /// Harnesses may override this when activity is represented by a
+    /// combination of markers rather than one unique substring.
+    fn is_active(&self, visible: &str) -> bool {
+        visible.lines().rev().take(8).any(|line| {
+            self.active_patterns()
+                .iter()
+                .any(|pattern| contains_case_insensitive(line, pattern))
+        })
+    }
+
     /// Whether the visible pane shows the agent waiting for input.
     ///
     /// Agents whose composer is always visible can override this and use a
     /// status indicator instead of `idle_patterns`.
     fn is_idle(&self, visible: &str) -> bool {
-        let is_active = self
-            .active_patterns()
-            .iter()
-            .any(|pattern| contains_case_insensitive(visible, pattern));
+        let is_active = self.is_active(visible);
         !is_active
             && self
                 .idle_patterns()
@@ -225,13 +233,20 @@ impl AgentHarness for CodexHarness {
         &["Working (", "esc to interrupt"]
     }
 
+    fn is_active(&self, visible: &str) -> bool {
+        // Codex renders `• Working (... • esc to interrupt)` immediately
+        // above its composer. Match the status-line structure near the bottom
+        // instead of those words anywhere in the transcript.
+        visible.lines().rev().take(8).any(|line| {
+            let line = line.trim_start().to_lowercase();
+            line.starts_with("• working (") && line.contains("esc to interrupt")
+        })
+    }
+
     fn is_idle(&self, visible: &str) -> bool {
         // Codex keeps its composer visible for the entire session. Its
         // transient Working/interrupt status is the reliable distinction.
-        !self
-            .active_patterns()
-            .iter()
-            .any(|pattern| contains_case_insensitive(visible, pattern))
+        !self.is_active(visible)
     }
 }
 
@@ -265,16 +280,24 @@ impl AgentHarness for CopilotHarness {
     }
 
     fn active_patterns(&self) -> &[&str] {
-        // Copilot's composer remains on screen while it works. Its working
-        // status is the reliable signal that a task is not waiting for input.
-        &["Working", "esc to interrupt"]
+        &["esc interrupt", "esc to interrupt"]
+    }
+
+    fn is_active(&self, visible: &str) -> bool {
+        // Copilot renders `● Working · … esc interrupt` on one status line.
+        // Requiring both parts avoids matching ordinary transcript text such
+        // as "current working directory" after Copilot has become idle.
+        visible.lines().rev().take(8).any(|line| {
+            contains_case_insensitive(line, "working")
+                && self
+                    .active_patterns()
+                    .iter()
+                    .any(|pattern| contains_case_insensitive(line, pattern))
+        })
     }
 
     fn is_idle(&self, visible: &str) -> bool {
-        !self
-            .active_patterns()
-            .iter()
-            .any(|pattern| contains_case_insensitive(visible, pattern))
+        !self.is_active(visible)
     }
 }
 
@@ -383,6 +406,11 @@ mod tests {
         let harness = CodexHarness;
         assert!(harness.is_idle("› task text\n\n  gpt-5.6-luna medium"));
         assert!(!harness.is_idle("› task text\n\n• Working (5s • esc to interrupt)"));
+        assert!(harness.is_idle(
+            "The answer mentions Working (5s • esc to interrupt) in prose.\n\n› Ask Codex to do anything\n\nmodel"
+        ));
+        assert!(harness
+            .is_idle("• Working (old • esc to interrupt)\n1\n2\n3\n4\n5\n6\n7\n8\n› Ask Codex"));
     }
 
     #[test]
@@ -415,8 +443,9 @@ mod tests {
         let harness = CopilotHarness;
         assert_eq!(harness.name(), "copilot");
         assert_eq!(harness.process_name(), "copilot");
-        assert!(harness.is_idle("› Tell Copilot what to do"));
-        assert!(!harness.is_idle("Working (3s) · esc to interrupt"));
+        assert!(harness.is_idle("$ Shell List files in current working directory\n\nWhich option?"));
+        assert!(!harness.is_idle("● Working · 507 B esc interrupt"));
+        assert!(!harness.is_idle("● Working (3s) · esc to interrupt"));
         assert!(harness
             .spawn_command("it's $HOME")
             .contains("'it'\\''s $HOME'"));

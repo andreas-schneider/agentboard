@@ -233,10 +233,6 @@ pub fn check_blocked_resumptions(
 
     for task in blocked_tasks {
         let harness = harness_for_task(store, task);
-        let active_patterns = harness.active_patterns();
-        if active_patterns.is_empty() {
-            continue;
-        }
         if let Some(ref session) = task.tmux_session {
             // Only check tasks whose session is still alive.
             let alive = session_alive.get(session).copied().unwrap_or(false);
@@ -245,10 +241,7 @@ pub fn check_blocked_resumptions(
             }
 
             if let Ok(visible) = tmux::capture_visible_pane(session) {
-                let is_active = active_patterns
-                    .iter()
-                    .any(|pattern| visible.to_lowercase().contains(&pattern.to_lowercase()));
-                if is_active {
+                if harness.is_active(&visible) {
                     let _ = store.update_status(&task.id, TaskStatus::Running);
                     resumed.push(task.id.clone());
                 }
