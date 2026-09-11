@@ -46,6 +46,8 @@ args = ["--cd", ".", "--ask-for-approval", "never", "--sandbox", "danger-full-ac
 resume_args = ["resume", "--last"]
 
 [profiles.unattended.copilot]
+# Add "--autopilot" to both lists to let Copilot continue until it completes the task.
+# Keep it opt-in: --no-ask-user only suppresses clarifying questions.
 args = ["-C", ".", "--allow-all", "--no-ask-user", "--interactive"]
 resume_args = ["-C", ".", "--allow-all", "--no-ask-user", "--continue"]
 "#;

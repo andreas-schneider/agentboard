@@ -57,6 +57,8 @@ args = ["--cd", ".", "--ask-for-approval", "never", "--sandbox", "danger-full-ac
 resume_args = ["resume", "--last"]
 
 [profiles.unattended.copilot]
+# Add "--autopilot" to both lists to let Copilot continue until it completes the task.
+# Keep it opt-in: --no-ask-user only suppresses clarifying questions.
 args = ["-C", ".", "--allow-all", "--no-ask-user", "--interactive"]
 resume_args = ["-C", ".", "--allow-all", "--no-ask-user", "--continue"]
 ```
@@ -70,6 +72,15 @@ not as a shell command.
 Agentboard currently supports `kiro-cli`, `codex`, and GitHub Copilot CLI
 (`copilot`). Some terminal interaction
 and completion detection remains specific to each supported CLI.
+
+### Copilot autopilot
+
+The built-in Copilot unattended profile grants tool permissions and suppresses
+clarifying questions, but does not enable `--autopilot` by default. This keeps
+control of when Copilot may continue through successive steps with you. To let
+it work until it reports the task complete, add `"--autopilot"` to both of
+the profile's argument lists (`args` and `resume_args`). You can also add
+`"--max-autopilot-continues"` and a numeric limit to bound those continuations.
 
 ## One-time overrides
 
