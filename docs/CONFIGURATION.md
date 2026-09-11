@@ -28,7 +28,7 @@ program = "kiro-cli"
 
 [agents.codex]
 program = "codex"
-# model = "gpt-5-codex"
+# model = "gpt-5.6-luna"
 
 [agents.copilot]
 program = "copilot"
