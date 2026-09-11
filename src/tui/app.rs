@@ -210,9 +210,26 @@ impl App {
             })
             .collect();
 
-        // Done lane: most recently completed on top (descending updated_at).
-        if *status == TaskStatus::Done {
-            tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        // Each lane has an order that matches its purpose. `updated_at` is
+        // changed when a task enters Running, Blocked, or Done, so it also
+        // records when the task most recently became relevant in that lane.
+        match status {
+            // Keep long-waiting work visible instead of continually pushing it
+            // down as new backlog items arrive.
+            TaskStatus::Backlog => tasks.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            }),
+            // Surface the task with the most recent activity, problem, or
+            // completion first.
+            TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done => {
+                tasks.sort_by(|a, b| {
+                    b.updated_at
+                        .cmp(&a.updated_at)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+            }
         }
 
         tasks
@@ -696,5 +713,118 @@ impl App {
                 actions
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, status: TaskStatus, created_at: &str, updated_at: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            title: id.to_string(),
+            description: String::new(),
+            status,
+            repo_path: "/tmp/repo".to_string(),
+            worktree_path: None,
+            branch_name: None,
+            tmux_session: None,
+            created_at: created_at.to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn tasks_are_sorted_for_their_lane_not_the_global_store_order() {
+        let backlog_new = task(
+            "backlog-new",
+            TaskStatus::Backlog,
+            "2026-01-03T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        );
+        let backlog_old = task(
+            "backlog-old",
+            TaskStatus::Backlog,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let running_old = task(
+            "running-old",
+            TaskStatus::Running,
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        );
+        let running_recent = task(
+            "running-recent",
+            TaskStatus::Running,
+            "2026-01-02T00:00:00Z",
+            "2026-01-04T00:00:00Z",
+        );
+        let blocked_old = task(
+            "blocked-old",
+            TaskStatus::Blocked,
+            "2026-01-01T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        );
+        let blocked_recent = task(
+            "blocked-recent",
+            TaskStatus::Blocked,
+            "2026-01-02T00:00:00Z",
+            "2026-01-05T00:00:00Z",
+        );
+        let done_old = task(
+            "done-old",
+            TaskStatus::Done,
+            "2026-01-01T00:00:00Z",
+            "2026-01-04T00:00:00Z",
+        );
+        let done_recent = task(
+            "done-recent",
+            TaskStatus::Done,
+            "2026-01-02T00:00:00Z",
+            "2026-01-06T00:00:00Z",
+        );
+
+        let app = App {
+            tasks: vec![
+                backlog_new,
+                backlog_old,
+                running_old,
+                running_recent,
+                blocked_old,
+                blocked_recent,
+                done_old,
+                done_recent,
+            ],
+            selected_column: 0,
+            selected_row: 0,
+            columns: vec![],
+            should_quit: false,
+            store: TaskStore::open_in_memory().unwrap(),
+            detail_lines: String::new(),
+            detail_scroll: 0,
+            detail_at_bottom: true,
+            last_refresh: Instant::now(),
+            last_detail_capture: Instant::now(),
+            session_alive: Default::default(),
+            task_started_at: Default::default(),
+            notification: None,
+            input_mode: InputMode::Normal,
+            show_help: false,
+            repo_filter: None,
+        };
+
+        let ids = |status| {
+            app.tasks_in_column(&status)
+                .into_iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(TaskStatus::Backlog), ["backlog-old", "backlog-new"]);
+        assert_eq!(ids(TaskStatus::Running), ["running-recent", "running-old"]);
+        assert_eq!(ids(TaskStatus::Blocked), ["blocked-recent", "blocked-old"]);
+        assert_eq!(ids(TaskStatus::Done), ["done-recent", "done-old"]);
     }
 }
