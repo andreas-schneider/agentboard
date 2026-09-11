@@ -595,7 +595,7 @@ fn render_new_task_form(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .title(Span::styled(
-            " New Task (Tab: next field, Enter: create, Esc: cancel) ",
+            " New Task (Tab: next field, Ctrl+S: create, Esc: cancel) ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -868,7 +868,7 @@ fn render_edit_task_form(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
-            " Edit Task (Tab: next field, Enter: save, Esc: cancel) ",
+            " Edit Task (Tab: next field, Ctrl+S: save, Esc: cancel) ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

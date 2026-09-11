@@ -13,7 +13,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -31,7 +31,11 @@ use app::{App, InputMode};
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    // Receive a clipboard paste as one Event::Paste instead of one Key event
+    // per character. In particular, this keeps pasted newlines from being
+    // mistaken for form submission.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+        .context("failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend).context("failed to create terminal")?;
     Ok(terminal)
@@ -39,8 +43,12 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode().context("failed to disable raw mode")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("failed to leave alternate screen")?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )
+    .context("failed to leave alternate screen")?;
     terminal.show_cursor().context("failed to show cursor")?;
     Ok(())
 }
@@ -136,20 +144,21 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
         }
 
         if event::poll(Duration::from_millis(200)).context("event poll failed")? {
-            if let Event::Key(key) = event::read().context("event read failed")? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                match &app.input_mode {
+            match event::read().context("event read failed")? {
+                Event::Paste(text) => match &app.input_mode {
+                    InputMode::NewTask { .. } => keys::handle_new_task_paste(app, &text),
+                    InputMode::EditTask { .. } => keys::handle_edit_task_paste(app, &text),
+                    _ => {}
+                },
+                Event::Key(key) if key.kind == KeyEventKind::Press => match &app.input_mode {
                     InputMode::Normal => {
                         keys::handle_normal_key(terminal, app, key.code)?;
                     }
                     InputMode::NewTask { .. } => {
-                        keys::handle_new_task_key(app, key.code)?;
+                        keys::handle_new_task_key(app, key)?;
                     }
                     InputMode::EditTask { .. } => {
-                        keys::handle_edit_task_key(app, key.code)?;
+                        keys::handle_edit_task_key(app, key)?;
                     }
                     InputMode::SendMessage { .. } => {
                         keys::handle_send_message_key(app, key.code)?;
@@ -160,7 +169,8 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                     InputMode::QuickPrompts => {
                         keys::handle_quick_prompt_key(app, key.code)?;
                     }
-                }
+                },
+                _ => {}
             }
         }
     }
