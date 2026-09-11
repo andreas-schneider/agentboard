@@ -344,81 +344,7 @@ impl App {
         let mut bell = false;
 
         if now.duration_since(self.last_refresh) >= REFRESH_INTERVAL {
-            self.tasks = self.store.list_tasks()?;
-            self.clamp_row();
-            self.check_sessions();
-
-            // Detect agent completion for running tasks via the orchestrator.
-            let running: Vec<Task> = self
-                .tasks
-                .iter()
-                .filter(|t| t.status == TaskStatus::Running)
-                .cloned()
-                .collect();
-
-            // Build the set of task IDs still in their grace period.
-            let grace_task_ids: std::collections::HashSet<String> = self
-                .task_started_at
-                .iter()
-                .filter(|(_, started)| now.duration_since(**started) < TASK_START_GRACE_PERIOD)
-                .map(|(id, _)| id.clone())
-                .collect();
-
-            let events = orchestrator::check_completions(
-                &self.store,
-                &running,
-                &self.session_alive,
-                &grace_task_ids,
-            );
-
-            // Detect blocked/done tasks that have resumed working (e.g. user
-            // attached to tmux and gave the agent more work directly, or
-            // pressed Enter to start the agent on a Done task). These move
-            // back to Running so they appear in the Running column.
-            let resumable: Vec<Task> = self
-                .tasks
-                .iter()
-                .filter(|t| t.status == TaskStatus::Blocked || t.status == TaskStatus::Done)
-                .cloned()
-                .collect();
-
-            let resumed = orchestrator::check_blocked_resumptions(
-                &self.store,
-                &resumable,
-                &self.session_alive,
-            );
-
-            let status_changed = !events.is_empty() || !resumed.is_empty();
-
-            if !events.is_empty() {
-                // Clean up grace entries for completed tasks.
-                for event in &events {
-                    self.task_started_at.remove(&event.task_id);
-                }
-
-                // Show notification for the first event (most recent)
-                let event = &events[0];
-                self.notify(Notification::completion(
-                    event.message(),
-                    event.is_success(),
-                ));
-                bell = true;
-            } else if !resumed.is_empty() {
-                // Show a notification for the first resumed task.
-                let short_id = &resumed[0][..resumed[0].len().min(8)];
-                self.notify(Notification::info(format!(
-                    "Agent resumed working — {}",
-                    short_id,
-                )));
-            }
-
-            if status_changed {
-                // Reload tasks after status changes
-                self.tasks = self.store.list_tasks()?;
-                self.clamp_row();
-                self.check_sessions();
-            }
-
+            bell = self.refresh_now_with_activity()?;
             self.last_refresh = now;
         }
 
@@ -432,13 +358,82 @@ impl App {
     }
 
     pub fn refresh_now(&mut self) -> Result<()> {
+        self.refresh_now_with_activity().map(|_| ())
+    }
+
+    fn refresh_now_with_activity(&mut self) -> Result<bool> {
         self.tasks = self.store.list_tasks()?;
         self.clamp_row();
         self.check_sessions();
+        let bell = self.detect_activity()?;
         self.capture_detail();
         self.last_refresh = Instant::now();
         self.last_detail_capture = Instant::now();
-        Ok(())
+        Ok(bell)
+    }
+
+    /// Detect agent completion or resumption using the currently loaded tasks.
+    /// This is shared by periodic refreshes and explicit refreshes, including
+    /// the refresh performed when returning from an attached tmux session.
+    fn detect_activity(&mut self) -> Result<bool> {
+        let now = Instant::now();
+
+        let running: Vec<Task> = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Running)
+            .cloned()
+            .collect();
+
+        let grace_task_ids: std::collections::HashSet<String> = self
+            .task_started_at
+            .iter()
+            .filter(|(_, started)| now.duration_since(**started) < TASK_START_GRACE_PERIOD)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let events = orchestrator::check_completions(
+            &self.store,
+            &running,
+            &self.session_alive,
+            &grace_task_ids,
+        );
+
+        let resumable: Vec<Task> = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Blocked || t.status == TaskStatus::Done)
+            .cloned()
+            .collect();
+
+        let resumed =
+            orchestrator::check_blocked_resumptions(&self.store, &resumable, &self.session_alive);
+
+        if !events.is_empty() {
+            for event in &events {
+                self.task_started_at.remove(&event.task_id);
+            }
+
+            let event = &events[0];
+            self.notify(Notification::completion(
+                event.message(),
+                event.is_success(),
+            ));
+        } else if !resumed.is_empty() {
+            let short_id = &resumed[0][..resumed[0].len().min(8)];
+            self.notify(Notification::info(format!(
+                "Agent resumed working — {}",
+                short_id,
+            )));
+        }
+
+        if !events.is_empty() || !resumed.is_empty() {
+            self.tasks = self.store.list_tasks()?;
+            self.clamp_row();
+            self.check_sessions();
+        }
+
+        Ok(!events.is_empty())
     }
 
     // -- Detail capture -----------------------------------------------------
