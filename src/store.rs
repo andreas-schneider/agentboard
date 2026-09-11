@@ -66,6 +66,9 @@ pub struct Task {
     pub worktree_path: Option<String>,
     pub branch_name: Option<String>,
     pub tmux_session: Option<String>,
+    /// Agent CLI that owns this task's session. Backlog and legacy tasks may
+    /// not have one until they are started or detected from a live process.
+    pub agent_cli: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -76,6 +79,23 @@ pub struct Task {
 
 pub struct TaskStore {
     conn: rusqlite::Connection,
+}
+
+/// Add task-owned agent identity to databases created by older Agentboard
+/// versions. SQLite has no portable `ADD COLUMN IF NOT EXISTS`, so inspect the
+/// table first and keep startup migration idempotent.
+fn ensure_agent_cli_column(conn: &rusqlite::Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(tasks)")
+        .context("failed to inspect tasks schema")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "agent_cli") {
+        conn.execute("ALTER TABLE tasks ADD COLUMN agent_cli TEXT", [])
+            .context("failed to add task agent column")?;
+    }
+    Ok(())
 }
 
 impl TaskStore {
@@ -106,11 +126,14 @@ impl TaskStore {
                 worktree_path TEXT,
                 branch_name   TEXT,
                 tmux_session  TEXT,
+                agent_cli     TEXT,
                 created_at    TEXT NOT NULL,
                 updated_at    TEXT NOT NULL
             );",
         )
         .context("failed to create tasks table")?;
+
+        ensure_agent_cli_column(&conn)?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS deleted_tasks (
@@ -149,11 +172,14 @@ impl TaskStore {
                 worktree_path TEXT,
                 branch_name   TEXT,
                 tmux_session  TEXT,
+                agent_cli     TEXT,
                 created_at    TEXT NOT NULL,
                 updated_at    TEXT NOT NULL
             );",
         )
         .context("failed to create tasks table")?;
+
+        ensure_agent_cli_column(&conn)?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS deleted_tasks (
@@ -182,6 +208,7 @@ impl TaskStore {
             worktree_path: None,
             branch_name: None,
             tmux_session: None,
+            agent_cli: None,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -190,8 +217,8 @@ impl TaskStore {
             .execute(
                 "INSERT INTO tasks (id, title, description, status, repo_path,
                                     worktree_path, branch_name, tmux_session,
-                                    created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                    agent_cli, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     task.id,
                     task.title,
@@ -201,6 +228,7 @@ impl TaskStore {
                     task.worktree_path,
                     task.branch_name,
                     task.tmux_session,
+                    task.agent_cli,
                     task.created_at,
                     task.updated_at,
                 ],
@@ -216,7 +244,7 @@ impl TaskStore {
             .conn
             .prepare(
                 "SELECT id, title, description, status, repo_path,
-                        worktree_path, branch_name, tmux_session,
+                        worktree_path, branch_name, tmux_session, agent_cli,
                         created_at, updated_at
                  FROM tasks
                  ORDER BY created_at",
@@ -235,8 +263,9 @@ impl TaskStore {
                     worktree_path: row.get(5)?,
                     branch_name: row.get(6)?,
                     tmux_session: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    agent_cli: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             })
             .context("failed to execute list query")?
@@ -256,7 +285,7 @@ impl TaskStore {
             .conn
             .prepare(
                 "SELECT id, title, description, status, repo_path,
-                        worktree_path, branch_name, tmux_session,
+                        worktree_path, branch_name, tmux_session, agent_cli,
                         created_at, updated_at
                  FROM tasks
                  WHERE id LIKE ?1",
@@ -275,8 +304,9 @@ impl TaskStore {
                     worktree_path: row.get(5)?,
                     branch_name: row.get(6)?,
                     tmux_session: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    agent_cli: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             })
             .context("failed to execute get query")?
@@ -312,7 +342,7 @@ impl TaskStore {
     }
 
     /// Full update of the mutable fields: worktree_path, branch_name,
-    /// tmux_session, and status.
+    /// tmux_session, agent_cli, and status.
     pub fn update_task(&self, task: &Task) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         let rows = self
@@ -323,13 +353,15 @@ impl TaskStore {
                      worktree_path = ?2,
                      branch_name   = ?3,
                      tmux_session  = ?4,
-                     updated_at    = ?5
-                 WHERE id = ?6",
+                     agent_cli     = ?5,
+                     updated_at    = ?6
+                 WHERE id = ?7",
                 params![
                     task.status.to_string(),
                     task.worktree_path,
                     task.branch_name,
                     task.tmux_session,
+                    task.agent_cli,
                     now,
                     task.id,
                 ],
@@ -338,6 +370,22 @@ impl TaskStore {
 
         if rows == 0 {
             return Err(anyhow!("no task found with id '{}'", task.id));
+        }
+        Ok(())
+    }
+
+    /// Record the agent discovered in a live task session without changing
+    /// `updated_at`, which is also used by completion grace-period logic.
+    pub fn update_agent_cli(&self, id: &str, agent_cli: &str) -> Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE tasks SET agent_cli = ?1 WHERE id = ?2",
+                params![agent_cli, id],
+            )
+            .context("failed to update task agent")?;
+        if rows == 0 {
+            return Err(anyhow!("no task found with id '{}'", id));
         }
         Ok(())
     }
@@ -451,6 +499,7 @@ mod tests {
         assert!(task.worktree_path.is_none());
         assert!(task.branch_name.is_none());
         assert!(task.tmux_session.is_none());
+        assert!(task.agent_cli.is_none());
         assert!(!task.created_at.is_empty());
         assert_eq!(task.created_at, task.updated_at);
 
@@ -463,6 +512,7 @@ mod tests {
         assert_eq!(fetched.worktree_path, task.worktree_path);
         assert_eq!(fetched.branch_name, task.branch_name);
         assert_eq!(fetched.tmux_session, task.tmux_session);
+        assert_eq!(fetched.agent_cli, task.agent_cli);
         assert_eq!(fetched.created_at, task.created_at);
         assert_eq!(fetched.updated_at, task.updated_at);
     }
@@ -591,6 +641,7 @@ mod tests {
         task.worktree_path = Some("/tmp/repo/.agentboard-worktrees/test".into());
         task.branch_name = Some("ab/test-branch".into());
         task.tmux_session = Some("ab-test1234".into());
+        task.agent_cli = Some("codex".into());
 
         store.update_task(&task).unwrap();
 
@@ -602,6 +653,49 @@ mod tests {
         );
         assert_eq!(fetched.branch_name.as_deref(), Some("ab/test-branch"));
         assert_eq!(fetched.tmux_session.as_deref(), Some("ab-test1234"));
+        assert_eq!(fetched.agent_cli.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn migrates_legacy_tasks_table_with_agent_column() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                worktree_path TEXT,
+                branch_name TEXT,
+                tmux_session TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        ensure_agent_cli_column(&conn).unwrap();
+        ensure_agent_cli_column(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(tasks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "agent_cli"));
+    }
+
+    #[test]
+    fn discovered_agent_update_preserves_updated_at() {
+        let store = test_store();
+        let task = store.create_task("Detect agent", "", "/tmp/repo").unwrap();
+        store.update_agent_cli(&task.id, "copilot").unwrap();
+        let fetched = store.get_task(&task.id).unwrap();
+        assert_eq!(fetched.agent_cli.as_deref(), Some("copilot"));
+        assert_eq!(fetched.updated_at, task.updated_at);
     }
 
     #[test]

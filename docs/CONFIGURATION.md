@@ -30,6 +30,10 @@ program = "kiro-cli"
 program = "codex"
 # model = "gpt-5-codex"
 
+[agents.copilot]
+program = "copilot"
+# model = "auto"
+
 # The prompt is appended automatically. These are complete argument lists.
 [profiles.interactive.kiro-cli]
 args = ["chat"]
@@ -39,6 +43,10 @@ resume_args = ["chat", "--resume"]
 args = ["--cd", ".", "--ask-for-approval", "on-request", "--sandbox", "workspace-write"]
 resume_args = ["resume", "--last"]
 
+[profiles.interactive.copilot]
+args = ["-C", ".", "--interactive"]
+resume_args = ["-C", ".", "--continue"]
+
 # Use "unattended" only when you explicitly trust the agent and repository.
 [profiles.unattended.kiro-cli]
 args = ["chat", "--trust-all-tools"]
@@ -47,6 +55,10 @@ resume_args = ["chat", "--trust-all-tools", "--resume"]
 [profiles.unattended.codex]
 args = ["--cd", ".", "--ask-for-approval", "never", "--sandbox", "danger-full-access"]
 resume_args = ["resume", "--last"]
+
+[profiles.unattended.copilot]
+args = ["-C", ".", "--allow-all", "--no-ask-user", "--interactive"]
+resume_args = ["-C", ".", "--allow-all", "--no-ask-user", "--continue"]
 ```
 
 `agent` and `profile` select the defaults. Each `[agents.<name>]` entry defines
@@ -55,7 +67,8 @@ defines the complete arguments for starting and resuming that agent. The task
 prompt is appended automatically; arguments are passed as individual values,
 not as a shell command.
 
-Agentboard currently supports `kiro-cli` and `codex`. Some terminal interaction
+Agentboard currently supports `kiro-cli`, `codex`, and GitHub Copilot CLI
+(`copilot`). Some terminal interaction
 and completion detection remains specific to each supported CLI.
 
 ## One-time overrides
@@ -65,6 +78,7 @@ Global flags override the configuration for one command:
 ```bash
 ab --agent codex board
 ab --agent codex --model gpt-5.6-luna board
+ab --agent copilot board
 ab --profile interactive board
 ab --yolo board
 ```
@@ -76,3 +90,8 @@ isolates Git changes; it is not a security boundary.
 The selected executable must be installed, authenticated, and available on
 `PATH`. Agentboard checks this before it starts a task and reports which
 configuration entry to update when the executable cannot be found.
+
+Agentboard records the selected agent when a task starts. Live tmux sessions
+are inspected for their actual agent process, so tasks using different CLIs can
+be monitored on the same board. If a legacy task has no recorded agent, a live
+process is used to backfill it; otherwise the current default is the fallback.

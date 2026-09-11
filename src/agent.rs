@@ -10,6 +10,7 @@ use crate::config;
 /// Marker printed after the agent command exits, followed by the exit code.
 /// The orchestrator watches captured pane output for this pattern.
 pub const EXIT_MARKER: &str = "AB_AGENT_EXIT:";
+pub const SUPPORTED_AGENTS: &[&str] = &["kiro-cli", "codex", "copilot"];
 
 /// Trait implemented by every agent backend (kiro-cli, codex, aider, etc.).
 pub trait AgentHarness {
@@ -234,20 +235,70 @@ impl AgentHarness for CodexHarness {
     }
 }
 
-/// Return the configured agent harness.
+/// Harness for the GitHub Copilot CLI interactive interface.
 ///
-/// The user configuration selects the agent; `AGENTBOARD_AGENT=codex` is a
-/// temporary override. Kiro remains the built-in default.
+/// Copilot starts an interactive session with `--interactive <PROMPT>` and
+/// persists sessions per working directory. `--continue` therefore resumes
+/// the most recent session in Agentboard's task worktree.
+pub struct CopilotHarness;
+
+impl AgentHarness for CopilotHarness {
+    fn spawn_command(&self, prompt: &str) -> String {
+        let raw_cmd = configured_command("copilot", false, Some(prompt));
+        wrap_with_exit_marker(&raw_cmd)
+    }
+
+    fn name(&self) -> &str {
+        "copilot"
+    }
+
+    fn start_command(&self) -> String {
+        // `--interactive` requires a prompt, so do not use the normal spawn
+        // arguments when reopening a session solely to send a follow-up.
+        let mut cfg = resolve_config("copilot");
+        cfg.args.retain(|arg| arg != "--interactive" && arg != "-i");
+        wrap_with_exit_marker(&format_command(&cfg, false, None))
+    }
+
+    fn process_name(&self) -> &str {
+        "copilot"
+    }
+
+    fn active_patterns(&self) -> &[&str] {
+        // Copilot's composer remains on screen while it works. Its working
+        // status is the reliable signal that a task is not waiting for input.
+        &["Working", "esc to interrupt"]
+    }
+
+    fn is_idle(&self, visible: &str) -> bool {
+        !self
+            .active_patterns()
+            .iter()
+            .any(|pattern| contains_case_insensitive(visible, pattern))
+    }
+}
+
+/// Return a harness for a supported agent name.
+pub fn harness_for(agent: &str) -> Option<Box<dyn AgentHarness>> {
+    match agent {
+        "kiro-cli" => Some(Box::new(KiroCliHarness)),
+        "codex" => Some(Box::new(CodexHarness)),
+        "copilot" => Some(Box::new(CopilotHarness)),
+        _ => None,
+    }
+}
+
+/// Return the configured agent harness. Kiro remains the built-in default.
 pub fn default_harness() -> Box<dyn AgentHarness> {
     let agent = config::load()
         .ok()
         .and_then(|cfg| config::effective(&cfg, None).ok())
         .map(|cfg| cfg.agent)
         .or_else(|| std::env::var("AGENTBOARD_AGENT").ok());
-    match agent.as_deref() {
-        Some("codex") => Box::new(CodexHarness),
-        _ => Box::new(KiroCliHarness),
-    }
+    agent
+        .as_deref()
+        .and_then(harness_for)
+        .unwrap_or_else(|| Box::new(KiroCliHarness))
 }
 
 #[cfg(test)]
@@ -287,12 +338,20 @@ mod tests {
     #[test]
     fn default_harness_is_kiro_cli() {
         let h = default_harness();
-        let expected = if std::env::var("AGENTBOARD_AGENT").as_deref() == Ok("codex") {
-            "codex"
-        } else {
-            "kiro-cli"
+        let expected = match std::env::var("AGENTBOARD_AGENT").as_deref() {
+            Ok("codex") => "codex",
+            Ok("copilot") => "copilot",
+            _ => "kiro-cli",
         };
         assert_eq!(h.name(), expected);
+    }
+
+    #[test]
+    fn harness_lookup_supports_every_known_agent() {
+        for name in SUPPORTED_AGENTS {
+            assert_eq!(harness_for(name).unwrap().name(), *name);
+        }
+        assert!(harness_for("unknown").is_none());
     }
 
     #[test]
@@ -339,6 +398,36 @@ mod tests {
         let cmd = wrap_with_exit_marker(&format_command(&cfg, true, None));
         assert!(cmd.starts_with("'codex' 'resume' '--last'"));
         assert!(!cmd.contains("ignored original prompt"));
+    }
+
+    #[test]
+    fn copilot_spawn_and_resume_use_interactive_worktree_session() {
+        let cfg = config::builtin_effective("copilot", "interactive").unwrap();
+        let spawn = wrap_with_exit_marker(&format_command(&cfg, false, Some("implement it")));
+        assert!(spawn.starts_with("'copilot' '-C' '.' '--interactive' 'implement it'"));
+
+        let resume = wrap_with_exit_marker(&format_command(&cfg, true, None));
+        assert!(resume.starts_with("'copilot' '-C' '.' '--continue'"));
+    }
+
+    #[test]
+    fn copilot_harness_reports_working_state_and_escapes_prompt() {
+        let harness = CopilotHarness;
+        assert_eq!(harness.name(), "copilot");
+        assert_eq!(harness.process_name(), "copilot");
+        assert!(harness.is_idle("› Tell Copilot what to do"));
+        assert!(!harness.is_idle("Working (3s) · esc to interrupt"));
+        assert!(harness
+            .spawn_command("it's $HOME")
+            .contains("'it'\\''s $HOME'"));
+    }
+
+    #[test]
+    fn copilot_start_command_omits_interactive_flag_without_a_prompt() {
+        let harness = CopilotHarness;
+        let command = harness.start_command();
+        assert!(command.starts_with("'copilot' '-C' '.'"));
+        assert!(!command.contains("--interactive"));
     }
 
     #[test]

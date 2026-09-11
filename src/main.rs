@@ -75,7 +75,7 @@ fn main() -> Result<()> {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "your user configuration file".to_owned());
             anyhow::bail!(
-                "Configured agent CLI '{}' (agent '{}') was not found on PATH. Install it, make sure it is executable, or update '{}' ([agents.{}.program]). Currently supported CLIs are kiro-cli and codex.",
+                "Configured agent CLI '{}' (agent '{}') was not found on PATH. Install it, make sure it is executable, or update '{}' ([agents.{}.program]). Currently supported CLIs are kiro-cli, codex, and copilot.",
                 effective.program,
                 effective.agent,
                 config_path,
@@ -193,6 +193,10 @@ fn main() -> Result<()> {
             println!("Task: {}", task.title);
             println!("ID: {}", task.id);
             println!("Status: {}", task.status);
+            println!(
+                "Agent: {}",
+                task.agent_cli.as_deref().unwrap_or("not started")
+            );
             println!("Repo: {}", task.repo_path);
             if let Some(ref branch) = task.branch_name {
                 println!("Branch: {}", branch);

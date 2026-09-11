@@ -482,6 +482,92 @@ pub fn has_agent_descendant(root_pid: u32, needle: &str) -> bool {
     false
 }
 
+/// Identify which supported agent owns a pane process tree.
+///
+/// Process identity is checked across the whole tree before command-line
+/// substrings. That ordering matters because an agent's prompt can itself
+/// mention another supported CLI. The substring pass remains as a portability
+/// fallback for launchers whose executable name hides the wrapped program.
+pub fn detect_agent_descendant<'a>(root_pid: u32, candidates: &'a [&str]) -> Option<&'a str> {
+    let pids = descendant_pids(root_pid);
+
+    for pid in &pids {
+        for &candidate in candidates {
+            if process_identity_matches(*pid, &candidate.to_lowercase()) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for pid in pids {
+        for &candidate in candidates {
+            if process_matches(pid, &candidate.to_lowercase()) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn descendant_pids(root_pid: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut to_visit = vec![root_pid];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(pid) = to_visit.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        found.push(pid);
+        let children_path = format!("/proc/{pid}/task/{pid}/children");
+        let children = if let Ok(contents) = std::fs::read_to_string(&children_path) {
+            contents
+                .split_whitespace()
+                .filter_map(|value| value.parse::<u32>().ok())
+                .collect()
+        } else {
+            match Command::new("pgrep")
+                .args(["-P", &pid.to_string()])
+                .output()
+            {
+                Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .filter_map(|value| value.parse::<u32>().ok())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        to_visit.extend(children);
+    }
+    found
+}
+
+fn process_identity_matches(pid: u32, needle_lower: &str) -> bool {
+    let comm_path = format!("/proc/{pid}/comm");
+    if std::fs::read_to_string(comm_path)
+        .map(|comm| comm.to_lowercase().contains(needle_lower))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    std::fs::read(cmdline_path)
+        .ok()
+        .and_then(|cmdline| {
+            cmdline
+                .split(|byte| *byte == 0)
+                .next()
+                .map(|argv0| String::from_utf8_lossy(argv0).to_lowercase())
+        })
+        .and_then(|argv0| {
+            std::path::Path::new(&argv0)
+                .file_name()
+                .map(|name| name.to_string_lossy().contains(needle_lower))
+        })
+        .unwrap_or(false)
+}
+
 /// Match both the short process name and its full command line. The latter
 /// matters for Codex, which can be launched through a sandbox wrapper whose
 /// executable name does not identify the agent in `comm`.

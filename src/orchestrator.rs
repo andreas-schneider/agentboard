@@ -5,6 +5,30 @@ use crate::tmux;
 use crate::worktree;
 use anyhow::Result;
 
+/// Resolve the harness that actually owns a task session.
+///
+/// A live process is authoritative, which also handles users manually
+/// replacing the agent inside a tmux session. Persisted identity covers idle,
+/// exited, and restored sessions. Legacy backlog tasks fall back to the agent
+/// selected for this Agentboard invocation.
+fn harness_for_task(store: &TaskStore, task: &Task) -> Box<dyn agent::AgentHarness> {
+    if let Some(session) = &task.tmux_session {
+        if let Ok(pid) = tmux::pane_pid(session) {
+            if let Some(name) = tmux::detect_agent_descendant(pid, agent::SUPPORTED_AGENTS) {
+                if task.agent_cli.as_deref() != Some(name) {
+                    let _ = store.update_agent_cli(&task.id, name);
+                }
+                return agent::harness_for(name).expect("known agent must have a harness");
+            }
+        }
+    }
+
+    task.agent_cli
+        .as_deref()
+        .and_then(agent::harness_for)
+        .unwrap_or_else(agent::default_harness)
+}
+
 // ---------------------------------------------------------------------------
 // Completion detection
 // ---------------------------------------------------------------------------
@@ -84,8 +108,6 @@ pub fn check_completions(
     session_alive: &std::collections::HashMap<String, bool>,
     grace_task_ids: &std::collections::HashSet<String>,
 ) -> Vec<CompletionEvent> {
-    let harness = agent::default_harness();
-    let process_needle = harness.process_name();
     let mut events = Vec::new();
 
     // DB-level grace period — a secondary safety net independent of
@@ -108,6 +130,9 @@ pub fn check_completions(
         }) {
             continue;
         }
+
+        let harness = harness_for_task(store, task);
+        let process_needle = harness.process_name();
 
         if let Some(ref session) = task.tmux_session {
             // Tier 1: Session dead entirely — always check, even during grace period.
@@ -204,16 +229,14 @@ pub fn check_blocked_resumptions(
     blocked_tasks: &[Task],
     session_alive: &std::collections::HashMap<String, bool>,
 ) -> Vec<String> {
-    let harness = agent::default_harness();
-    let active_patterns = harness.active_patterns();
     let mut resumed = Vec::new();
 
-    // Nothing to detect if the harness has no active patterns.
-    if active_patterns.is_empty() {
-        return resumed;
-    }
-
     for task in blocked_tasks {
+        let harness = harness_for_task(store, task);
+        let active_patterns = harness.active_patterns();
+        if active_patterns.is_empty() {
+            continue;
+        }
         if let Some(ref session) = task.tmux_session {
             // Only check tasks whose session is still alive.
             let alive = session_alive.get(session).copied().unwrap_or(false);
@@ -264,8 +287,6 @@ pub struct RestoreResult {
 /// Tasks where restoration fails (e.g., worktree deleted) are moved to Blocked.
 pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
     let tasks = store.list_tasks()?;
-    let harness = agent::default_harness();
-
     let mut result = RestoreResult {
         restored: Vec::new(),
         failed: Vec::new(),
@@ -352,6 +373,7 @@ pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
         }
 
         // 4. Re-launch the agent using the harness's resume behavior
+        let harness = harness_for_task(store, task);
         let prompt = build_prompt(task);
         let cmd = harness.resume_command(&prompt);
         if let Err(e) = tmux::send_command(&session, &cmd) {
@@ -365,6 +387,7 @@ pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
         // 5. Update the task in the DB (ensure session name is correct)
         let mut updated = task.clone();
         updated.tmux_session = Some(session.clone());
+        updated.agent_cli = Some(harness.name().to_owned());
         if let Err(e) = store.update_task(&updated) {
             eprintln!(
                 "[restore] Failed to update DB for {}: {} — killing restored session",
@@ -472,6 +495,7 @@ pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool)
     updated.worktree_path = Some(wt_path);
     updated.branch_name = Some(branch);
     updated.tmux_session = Some(session);
+    updated.agent_cli = Some(harness.name().to_owned());
     store.update_task(&updated)?;
 
     Ok(updated)
@@ -508,7 +532,7 @@ pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
         return Err(e.context("failed to create tmux session"));
     }
 
-    let harness = agent::default_harness();
+    let harness = harness_for_task(store, task);
     let prompt = build_prompt(task);
     let cmd = harness.spawn_command(&prompt);
     if let Err(e) = tmux::send_command(&session, &cmd) {
@@ -527,6 +551,7 @@ pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
     updated.status = TaskStatus::Running;
     updated.worktree_path = Some(wt_path);
     updated.tmux_session = Some(session);
+    updated.agent_cli = Some(harness.name().to_owned());
     store.update_task(&updated)?;
 
     Ok(updated)
@@ -565,7 +590,7 @@ pub fn resume_task(store: &TaskStore, task: &Task, desired_status: TaskStatus) -
         return Err(e.context("failed to create tmux session"));
     }
 
-    let harness = agent::default_harness();
+    let harness = harness_for_task(store, task);
     let prompt = build_prompt(task);
     let cmd = harness.resume_command(&prompt);
     if let Err(e) = tmux::send_command(&session, &cmd) {
@@ -583,6 +608,7 @@ pub fn resume_task(store: &TaskStore, task: &Task, desired_status: TaskStatus) -
     updated.status = desired_status;
     updated.worktree_path = Some(wt_path);
     updated.tmux_session = Some(session);
+    updated.agent_cli = Some(harness.name().to_owned());
     store.update_task(&updated)?;
 
     Ok(updated)
@@ -590,12 +616,14 @@ pub fn resume_task(store: &TaskStore, task: &Task, desired_status: TaskStatus) -
 
 /// Kill a running task: terminate the tmux session and mark as Blocked.
 pub fn kill_task(store: &TaskStore, task: &Task) -> Result<Task> {
+    let harness = harness_for_task(store, task);
     if let Some(ref session) = task.tmux_session {
         tmux::kill_session(session)?;
     }
     let mut updated = task.clone();
     updated.status = TaskStatus::Blocked;
     updated.tmux_session = None;
+    updated.agent_cli = Some(harness.name().to_owned());
     store.update_task(&updated)?;
     Ok(updated)
 }
@@ -610,7 +638,7 @@ pub fn send_message(store: &TaskStore, task: &Task, message: &str) -> Result<Tas
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Task {} has no tmux session", &task.id[..8]))?;
 
-    let harness = agent::default_harness();
+    let harness = harness_for_task(store, task);
 
     // A completed agent often leaves its shell and tmux session alive. In
     // that state send-keys only types into the shell; it does not start a new
@@ -640,8 +668,11 @@ pub fn send_message(store: &TaskStore, task: &Task, message: &str) -> Result<Tas
     tmux::send_command(session, message)?;
 
     let mut updated = task.clone();
+    updated.agent_cli = Some(harness.name().to_owned());
     if task.status == TaskStatus::Blocked {
         updated.status = TaskStatus::Running;
+    }
+    if updated.status != task.status || updated.agent_cli != task.agent_cli {
         store.update_task(&updated)?;
     }
 
@@ -699,8 +730,10 @@ pub fn delete_task(store: &TaskStore, task: &Task) -> Result<()> {
 
 /// Mark a task as done: update status, keep session and worktree alive for inspection.
 pub fn done_task(store: &TaskStore, task: &Task) -> Result<Task> {
+    let harness = harness_for_task(store, task);
     let mut updated = task.clone();
     updated.status = TaskStatus::Done;
+    updated.agent_cli = Some(harness.name().to_owned());
     store.update_task(&updated)?;
     Ok(updated)
 }
@@ -735,6 +768,7 @@ mod tests {
             worktree_path: None,
             branch_name: None,
             tmux_session: None,
+            agent_cli: None,
             created_at: String::new(),
             updated_at: String::new(),
         }
