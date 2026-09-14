@@ -232,6 +232,9 @@ pub fn send_text(session: &str, text: &str) -> Result<()> {
 ///
 /// First sends the text via `send-keys -l` (literal mode, no key-name
 /// interpretation), then sends `Enter` as a named key in a separate call.
+/// Give the terminal application a brief moment to consume the text before
+/// submitting it; Codex can otherwise display the complete prompt while its
+/// input handler has not yet processed all of the queued characters.
 ///
 /// We deliberately avoid appending `\n` to the literal text because
 /// `send-keys -l` delivers a literal newline character (0x0A) to the pty.
@@ -240,6 +243,7 @@ pub fn send_text(session: &str, text: &str) -> Result<()> {
 /// generates when it processes the `Enter` key name.
 pub fn send_command(session: &str, command: &str) -> Result<()> {
     send_text(session, command)?;
+    thread::sleep(Duration::from_millis(100));
     press_key(session, "Enter")
 }
 
