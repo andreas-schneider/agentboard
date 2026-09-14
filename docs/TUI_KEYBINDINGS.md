@@ -17,7 +17,7 @@
 |-----|--------|
 | `Enter` | Start (backlog) / Attach or auto-resume (running/blocked/done) |
 | `s` | Start selected backlog task |
-| `e` | Edit backlog task (title, description, repo) |
+| `e` | Edit backlog task (title, description, working directory) |
 | `m` | Send a message to an agent (running/blocked) |
 | `p` | Open the quick prompts palette |
 | `K` | Kill a running task (with confirmation) |
@@ -30,9 +30,16 @@
 | Key | Action |
 |-----|--------|
 | `n` | Create a new task |
+
+While creating a task, `Tab`/arrow keys navigate through the fields and the
+optional Meta task toggle. Press `Enter` or `Space` when the toggle is focused
+to activate it. Meta tasks add Agentboard board/task-management context. Their
+Working directory defaults to a generated Agentboard meta-workspace but remains
+editable; a Git directory still uses a task worktree.
+
 | `r` | Refresh the task list |
-| `f` | Cycle the repository filter |
-| `F` | Clear the repository filter |
+| `f` | Cycle the working-directory filter |
+| `F` | Clear the working-directory filter |
 | `?` | Show the help overlay |
 | `q`/`Esc` | Quit |
 

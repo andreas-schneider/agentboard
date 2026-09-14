@@ -11,12 +11,12 @@ TUI.
 
 | Command | Description |
 |---------|-------------|
-| `ab new "title" [--repo /path] [-d "details"]` | Create a backlog task; the repository defaults to the current directory |
-| `ab start <id>` | Start a task and create its worktree and agent session |
+| `ab new "title" [--dir /path] [-d "details"] [--meta]` | Create a backlog task; the working directory defaults to the current directory. Git directories get a worktree; other directories run directly. `--meta` supplies board/task-management context and, when no directory is supplied, an Agentboard-managed directory. `--repo` remains an alias for `--dir`. |
+| `ab start <id>` | Start a task; Git working directories get a worktree, while other directories run directly in an agent session |
 | `ab list` | List tasks |
 | `ab show <id>` | Show task details and recent agent output |
 | `ab attach <id>` | Attach to a task's tmux session |
-| `ab edit <id> [-t title] [-d details] [-r repo]` | Edit a backlog task |
+| `ab edit <id> [-t title] [-d details] [--dir path]` | Edit a backlog task. `--repo` remains an alias for `--dir`. |
 | `ab kill <id>` | Stop a running task's agent session |
 | `ab done <id>` | Mark a task done while preserving its session and worktree |
 

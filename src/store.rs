@@ -63,6 +63,8 @@ pub struct Task {
     pub description: String,
     pub status: TaskStatus,
     pub repo_path: String,
+    /// Whether this task receives Agentboard board/task-management context.
+    pub is_meta: bool,
     pub worktree_path: Option<String>,
     pub branch_name: Option<String>,
     pub tmux_session: Option<String>,
@@ -98,6 +100,23 @@ fn ensure_agent_cli_column(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_is_meta_column(conn: &rusqlite::Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(tasks)")
+        .context("failed to inspect tasks schema")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "is_meta") {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN is_meta INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("failed to add task meta column")?;
+    }
+    Ok(())
+}
+
 impl TaskStore {
     /// Open (or create) the database at `~/.agentboard/agentboard.db`.
     pub fn open() -> Result<Self> {
@@ -127,6 +146,7 @@ impl TaskStore {
                 branch_name   TEXT,
                 tmux_session  TEXT,
                 agent_cli     TEXT,
+                is_meta       INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT NOT NULL,
                 updated_at    TEXT NOT NULL
             );",
@@ -134,6 +154,7 @@ impl TaskStore {
         .context("failed to create tasks table")?;
 
         ensure_agent_cli_column(&conn)?;
+        ensure_is_meta_column(&conn)?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS deleted_tasks (
@@ -173,6 +194,7 @@ impl TaskStore {
                 branch_name   TEXT,
                 tmux_session  TEXT,
                 agent_cli     TEXT,
+                is_meta       INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT NOT NULL,
                 updated_at    TEXT NOT NULL
             );",
@@ -180,6 +202,7 @@ impl TaskStore {
         .context("failed to create tasks table")?;
 
         ensure_agent_cli_column(&conn)?;
+        ensure_is_meta_column(&conn)?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS deleted_tasks (
@@ -198,6 +221,17 @@ impl TaskStore {
 
     /// Create a new task with `Backlog` status and a freshly generated UUID.
     pub fn create_task(&self, title: &str, description: &str, repo_path: &str) -> Result<Task> {
+        self.create_task_with_meta(title, description, repo_path, false)
+    }
+
+    /// Create a task, optionally with Agentboard board/task-management context.
+    pub fn create_task_with_meta(
+        &self,
+        title: &str,
+        description: &str,
+        repo_path: &str,
+        is_meta: bool,
+    ) -> Result<Task> {
         let now = chrono::Utc::now().to_rfc3339();
         let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
@@ -205,6 +239,7 @@ impl TaskStore {
             description: description.to_string(),
             status: TaskStatus::Backlog,
             repo_path: repo_path.to_string(),
+            is_meta,
             worktree_path: None,
             branch_name: None,
             tmux_session: None,
@@ -217,8 +252,8 @@ impl TaskStore {
             .execute(
                 "INSERT INTO tasks (id, title, description, status, repo_path,
                                     worktree_path, branch_name, tmux_session,
-                                    agent_cli, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                    agent_cli, is_meta, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     task.id,
                     task.title,
@@ -229,6 +264,7 @@ impl TaskStore {
                     task.branch_name,
                     task.tmux_session,
                     task.agent_cli,
+                    task.is_meta as i32,
                     task.created_at,
                     task.updated_at,
                 ],
@@ -245,7 +281,7 @@ impl TaskStore {
             .prepare(
                 "SELECT id, title, description, status, repo_path,
                         worktree_path, branch_name, tmux_session, agent_cli,
-                        created_at, updated_at
+                        created_at, updated_at, is_meta
                  FROM tasks
                  ORDER BY created_at",
             )
@@ -266,6 +302,7 @@ impl TaskStore {
                     agent_cli: row.get(8)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
+                    is_meta: row.get::<_, i32>(11)? != 0,
                 })
             })
             .context("failed to execute list query")?
@@ -280,15 +317,21 @@ impl TaskStore {
     /// If `id` is a prefix that matches exactly one task, that task is returned.
     /// If it matches zero or more than one, an error is returned.
     pub fn get_task(&self, id: &str) -> Result<Task> {
-        let pattern = format!("{}%", id);
+        // Treat the caller's value as a literal prefix, not a raw SQL LIKE
+        // pattern. Otherwise `_` and `%` could match unrelated tasks.
+        let escaped_id = id
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{}%", escaped_id);
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, title, description, status, repo_path,
                         worktree_path, branch_name, tmux_session, agent_cli,
-                        created_at, updated_at
+                        created_at, updated_at, is_meta
                  FROM tasks
-                 WHERE id LIKE ?1",
+                WHERE id LIKE ?1 ESCAPE '\\'",
             )
             .context("failed to prepare get query")?;
 
@@ -307,6 +350,7 @@ impl TaskStore {
                     agent_cli: row.get(8)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
+                    is_meta: row.get::<_, i32>(11)? != 0,
                 })
             })
             .context("failed to execute get query")?
@@ -496,6 +540,7 @@ mod tests {
         assert_eq!(task.description, "The login page crashes");
         assert_eq!(task.status, TaskStatus::Backlog);
         assert_eq!(task.repo_path, "/tmp/myrepo");
+        assert!(!task.is_meta);
         assert!(task.worktree_path.is_none());
         assert!(task.branch_name.is_none());
         assert!(task.tmux_session.is_none());
@@ -509,6 +554,7 @@ mod tests {
         assert_eq!(fetched.description, task.description);
         assert_eq!(fetched.status, task.status);
         assert_eq!(fetched.repo_path, task.repo_path);
+        assert_eq!(fetched.is_meta, task.is_meta);
         assert_eq!(fetched.worktree_path, task.worktree_path);
         assert_eq!(fetched.branch_name, task.branch_name);
         assert_eq!(fetched.tmux_session, task.tmux_session);
@@ -526,6 +572,25 @@ mod tests {
         let prefix = &task.id[..8];
         let fetched = store.get_task(prefix).unwrap();
         assert_eq!(fetched.id, task.id);
+    }
+
+    #[test]
+    fn meta_task_roundtrip_preserves_working_directory() {
+        let store = test_store();
+        let task = store
+            .create_task_with_meta(
+                "Review the board",
+                "Inspect backlog",
+                "/tmp/meta-workspace",
+                true,
+            )
+            .unwrap();
+
+        assert!(task.is_meta);
+        assert_eq!(task.repo_path, "/tmp/meta-workspace");
+        let fetched = store.get_task(&task.id).unwrap();
+        assert!(fetched.is_meta);
+        assert_eq!(fetched.repo_path, "/tmp/meta-workspace");
     }
 
     #[test]

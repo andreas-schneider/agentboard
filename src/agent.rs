@@ -361,11 +361,13 @@ mod tests {
     #[test]
     fn default_harness_is_kiro_cli() {
         let h = default_harness();
-        let expected = match std::env::var("AGENTBOARD_AGENT").as_deref() {
-            Ok("codex") => "codex",
-            Ok("copilot") => "copilot",
-            _ => "kiro-cli",
-        };
+        let expected = config::load()
+            .ok()
+            .and_then(|cfg| config::effective(&cfg, None).ok())
+            .map(|cfg| cfg.agent)
+            .or_else(|| std::env::var("AGENTBOARD_AGENT").ok())
+            .filter(|agent| SUPPORTED_AGENTS.contains(&agent.as_str()))
+            .unwrap_or_else(|| "kiro-cli".to_string());
         assert_eq!(h.name(), expected);
     }
 

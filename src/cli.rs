@@ -36,16 +36,20 @@ pub enum Commands {
         #[arg()]
         title: String,
 
-        /// Repository path (defaults to current directory)
-        #[arg(short, long)]
-        repo: Option<String>,
+        /// Working directory (Git directories use task worktrees; defaults to current directory)
+        #[arg(short = 'r', long = "dir", visible_alias = "repo")]
+        working_directory: Option<String>,
 
         /// Detailed description/prompt for the agent (if different from title)
         #[arg(short, long)]
         description: Option<String>,
+
+        /// Give the task Agentboard board/task-management context
+        #[arg(long)]
+        meta: bool,
     },
 
-    /// Start a task - creates worktree, spawns agent
+    /// Start a task - creates a Git worktree when applicable, then spawns an agent
     Start {
         /// Task ID (or unique prefix)
         #[arg()]
@@ -94,7 +98,7 @@ pub enum Commands {
         task_id: String,
     },
 
-    /// Edit a backlog task's title, description, or repo
+    /// Edit a backlog task's title, description, or working directory
     Edit {
         /// Task ID (or unique prefix)
         #[arg()]
@@ -104,9 +108,9 @@ pub enum Commands {
         #[arg(short, long)]
         title: Option<String>,
 
-        /// New repository path
-        #[arg(short, long)]
-        repo: Option<String>,
+        /// New working directory
+        #[arg(short = 'r', long = "dir", visible_alias = "repo")]
+        working_directory: Option<String>,
 
         /// New description/prompt for the agent
         #[arg(short, long)]

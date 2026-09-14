@@ -36,6 +36,8 @@ pub enum InputMode {
     NewTask {
         fields: Vec<InputField>,
         active_field: usize,
+        is_meta: bool,
+        previous_working_directory: Option<String>,
     },
     /// Editing an existing backlog task: multi-field form.
     EditTask {
@@ -165,7 +167,7 @@ pub struct App {
     // Help overlay
     pub show_help: bool,
 
-    // Repo filter: when Some, only tasks matching this repo_path are shown
+    // Working-directory filter: when Some, only matching tasks are shown.
     pub repo_filter: Option<String>,
 }
 
@@ -638,6 +640,7 @@ impl App {
         title: &str,
         description: &str,
         repo_path: &str,
+        is_meta: bool,
     ) -> Result<()> {
         let repo = if repo_path.is_empty() {
             std::env::current_dir()
@@ -652,13 +655,39 @@ impl App {
         } else {
             description
         };
-        let task = self.store.create_task(title, desc, &repo)?;
+        let task = self
+            .store
+            .create_task_with_meta(title, desc, &repo, is_meta)?;
         self.refresh_now()?;
         self.notify(Notification::info(format!(
-            "Created task: {} ({})",
+            "Created {} task: {} ({})",
+            if is_meta { "meta" } else { "new" },
             task.title,
             &task.id[..8]
         )));
+        Ok(())
+    }
+
+    pub fn toggle_new_task_meta(&mut self) -> Result<()> {
+        if let InputMode::NewTask {
+            ref mut fields,
+            ref mut is_meta,
+            ref mut previous_working_directory,
+            ..
+        } = self.input_mode
+        {
+            let directory = &mut fields[1];
+            if *is_meta {
+                directory.value = previous_working_directory.take().unwrap_or_default();
+                directory.cursor_pos = directory.value.len();
+                *is_meta = false;
+            } else {
+                *previous_working_directory = Some(directory.value.clone());
+                directory.value = orchestrator::suggested_meta_workspace()?;
+                directory.cursor_pos = directory.value.len();
+                *is_meta = true;
+            }
+        }
         Ok(())
     }
 
@@ -722,6 +751,7 @@ mod tests {
             description: String::new(),
             status,
             repo_path: "/tmp/repo".to_string(),
+            is_meta: false,
             worktree_path: None,
             branch_name: None,
             tmux_session: None,

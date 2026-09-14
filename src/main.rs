@@ -90,17 +90,26 @@ fn main() -> Result<()> {
         Commands::Config { .. } => unreachable!("configuration commands are handled above"),
         Commands::New {
             title,
-            repo,
+            working_directory,
             description,
+            meta,
         } => {
-            let repo_path = repo.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .expect("Failed to get current directory")
-                    .to_string_lossy()
-                    .to_string()
-            });
             let desc = description.as_deref().unwrap_or(&title);
-            let task = store.create_task(&title, desc, &repo_path)?;
+            let task = if meta {
+                let workspace = match working_directory {
+                    Some(path) => path,
+                    None => orchestrator::suggested_meta_workspace()?,
+                };
+                store.create_task_with_meta(&title, desc, &workspace, true)?
+            } else {
+                let working_directory = working_directory.unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .expect("Failed to get current directory")
+                        .to_string_lossy()
+                        .to_string()
+                });
+                store.create_task(&title, desc, &working_directory)?
+            };
             println!("Created task: {} ({})", task.title, &task.id[..8]);
         }
         Commands::Start {
@@ -129,7 +138,10 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             // Print a nicely formatted table
-            println!("{:<10} {:<12} {:<40} REPO", "ID", "STATUS", "TITLE");
+            println!(
+                "{:<10} {:<12} {:<40} WORKING DIRECTORY",
+                "ID", "STATUS", "TITLE"
+            );
             println!("{}", "-".repeat(80));
             for task in &tasks {
                 let short_id = &task.id[..8];
@@ -166,9 +178,10 @@ fn main() -> Result<()> {
             println!("│  Switch windows: Ctrl+B then A/S            │");
             println!("│  ⚠ Do NOT press Esc/Ctrl+C (kills agent)    │");
             println!("└─────────────────────────────────────────────┘");
-            if let Some(ref worktree) = task.worktree_path {
-                tmux::ensure_task_windows(session, worktree)?;
-            }
+            tmux::ensure_task_windows(
+                session,
+                task.worktree_path.as_deref().unwrap_or(&task.repo_path),
+            )?;
             tmux::attach_session(session)?;
         }
         Commands::Board { repo } => {
@@ -197,7 +210,10 @@ fn main() -> Result<()> {
                 "Agent: {}",
                 task.agent_cli.as_deref().unwrap_or("not started")
             );
-            println!("Repo: {}", task.repo_path);
+            println!("Working directory: {}", task.repo_path);
+            if task.is_meta {
+                println!("Target: Agentboard board (meta task)");
+            }
             if let Some(ref branch) = task.branch_name {
                 println!("Branch: {}", branch);
             }
@@ -239,7 +255,7 @@ fn main() -> Result<()> {
             task_id,
             title,
             description,
-            repo,
+            working_directory,
         } => {
             let task = store.get_task(&task_id)?;
             if task.status != store::TaskStatus::Backlog {
@@ -251,7 +267,7 @@ fn main() -> Result<()> {
             }
             let new_title = title.as_deref().unwrap_or(&task.title);
             let new_desc = description.as_deref().unwrap_or(&task.description);
-            let new_repo = repo.as_deref().unwrap_or(&task.repo_path);
+            let new_repo = working_directory.as_deref().unwrap_or(&task.repo_path);
             store.update_task_details(&task.id, new_title, new_desc, new_repo)?;
             println!("Updated task {} ({})", new_title, &task.id[..8]);
         }

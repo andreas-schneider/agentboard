@@ -52,6 +52,12 @@ switch with `Ctrl+b s` (or `Ctrl+b 1`/`p`) and return to the agent with
 scroll mode with `Esc`. Switch from the session back to the board with
 `Ctrl+b d`.
 
+For tasks that manage the Agentboard board or its tasks, enable `Meta task` in
+the New Task form. See [Meta tasks](docs/META_TASKS.md).
+
+Every task has an editable working directory: Git directories run in an
+isolated worktree, while other directories are used directly.
+
 Essential controls:
 
 | Key | Action |
@@ -89,6 +95,7 @@ only with agents, repositories, and credentials you trust.
 
 - [Configuration](docs/CONFIGURATION.md) — agents, models, profiles, and CLI arguments
 - [CLI reference](docs/CLI.md) — commands for scripts and non-TUI use
+- [Meta tasks](docs/META_TASKS.md) — board/task-management tasks and their agent context
 - [Worktree setup](docs/WORKTREE_SETUP.md) — repository and machine-specific setup
 - [TUI keybindings](docs/TUI_KEYBINDINGS.md) — all board and session controls
 - [Session restoration](docs/SESSION_RESTORATION.md) — experimental and not well tested

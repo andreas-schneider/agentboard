@@ -3,7 +3,7 @@ use crate::setup;
 use crate::store::{Task, TaskStatus, TaskStore};
 use crate::tmux;
 use crate::worktree;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Resolve the harness that actually owns a task session.
 ///
@@ -123,11 +123,11 @@ pub fn check_completions(
         // Setup runs in the task's tmux session before the agent is launched.
         // A dependency install or build may legitimately have no agent process
         // for several minutes, so do not classify that period as completion.
-        if task.worktree_path.as_ref().is_some_and(|path| {
-            std::path::Path::new(path)
-                .join(".agentboard/setup.running")
-                .exists()
-        }) {
+        let execution_path = task.worktree_path.as_deref().unwrap_or(&task.repo_path);
+        if std::path::Path::new(execution_path)
+            .join(".agentboard/setup.running")
+            .exists()
+        {
             continue;
         }
 
@@ -324,8 +324,8 @@ pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
         }
 
         // Need a working directory
-        let wt_path = match &task.worktree_path {
-            Some(wt) if std::path::Path::new(wt).exists() => wt.clone(),
+        let wt_path = match task.worktree_path.as_deref().unwrap_or(&task.repo_path) {
+            path if std::path::Path::new(path).exists() => path.to_string(),
             _ => {
                 // Worktree is gone — can't restore, move to Blocked
                 eprintln!(
@@ -337,6 +337,18 @@ pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
                 continue;
             }
         };
+
+        if task.is_meta {
+            if let Err(e) = write_meta_context(&wt_path, task) {
+                eprintln!(
+                    "[restore] Failed to refresh meta context for {}; moving to Blocked: {}",
+                    short_id, e
+                );
+                let _ = store.update_status(&task.id, TaskStatus::Blocked);
+                result.failed.push(task.id.clone());
+                continue;
+            }
+        }
 
         // 1. Create new tmux session
         if let Err(e) = tmux::create_session(&session, &wt_path) {
@@ -401,12 +413,69 @@ pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
 // Task lifecycle operations
 // ---------------------------------------------------------------------------
 
+/// Return a suggested, isolated working directory for a new meta task.
+pub fn suggested_meta_workspace() -> Result<String> {
+    let home = dirs::home_dir().context("could not determine home directory")?;
+    let path = home
+        .join(".agentboard")
+        .join("meta-workspaces")
+        .join(uuid::Uuid::new_v4().to_string());
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn write_meta_context(workspace: &str, task: &Task) -> Result<()> {
+    let context_dir = std::path::Path::new(workspace).join(".agentboard");
+    std::fs::create_dir_all(&context_dir).context("failed to create meta context directory")?;
+    let context_path = context_dir.join("meta-task-context.md");
+    let contents = format!(
+        "# Agentboard meta-task context\n\n\
+This is task `{}`: **{}**.\n\n\
+This task is about the Agentboard board and its tasks. Its working directory may be a regular folder or, when you selected a Git directory, a task worktree.\n\n\
+This workspace is for board operations, not the Agentboard source repository. Do not assume the source checkout is the current directory; use the `ab` CLI and the repository path shown by `ab show` when a task explicitly requires source changes.\n\n\
+## CLI\n\n\
+Use the non-interactive `ab` CLI to inspect and operate on the board. Do not run `ab board`: its TUI is for human operators.\n\n\
+* `ab list` — list tasks and statuses.\n\
+* `ab show <id>` — inspect a task and recent output.\n\
+* `ab new \"title\" [-d \"description\"] [--dir <path>] [--meta]` — create a task.\n\
+* `ab start <id>` — start a backlog task.\n\
+* `ab attach <id>` — attach to another task's live session.\n\
+* `ab edit <id> [-t \"title\"] [-d \"description\"] [--dir <path>]` — edit a backlog task.\n\
+* `ab kill <id>` — stop a running task and mark it Blocked.\n\
+* `ab done <id>` — mark a task Done.\n\
+* `ab config show` / `ab config check` — inspect or validate configuration.\n\n\
+Task IDs accept unique prefixes. Statuses are Backlog, Running, Blocked, and Done.\n\n\
+## Operating rules\n\n\
+Inspect a task with `ab show` before changing it. Preserve working-directory paths when creating or editing tasks. Do not delete tasks, kill sessions, modify Agentboard configuration, or bulk-change tasks unless the user explicitly asks. Do not mark a task Done merely because it was inspected; mark it Done only when its requested work is complete.\n\n\
+The current agent session is already owned by this task. It runs in tmux with an `agent` window and a `shell` window. You can inspect the session with `tmux display-message -p '#S'`, `tmux list-windows`, or `tmux capture-pane -p -S -100`. Do not kill or detach the current session unless explicitly asked.\n\n\
+The authoritative command reference is `ab --help` and `ab <command> --help`; see Agentboard's `docs/CLI.md` when its source checkout is available.\n\n\
+## User request\n\n{}\n",
+        task.id, task.title, task.description
+    );
+    std::fs::write(&context_path, contents).with_context(|| {
+        format!(
+            "failed to write meta task context {}",
+            context_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Build the prompt string for the agent from a task's title and description.
 ///
 /// The prompt must be a single line because it is sent to the agent via
 /// `tmux send-keys -l`, where literal newlines would be interpreted as Enter
 /// keypresses — splitting the command across multiple shell invocations.
 pub fn build_prompt(task: &Task) -> String {
+    if task.is_meta {
+        return format!(
+            "This is an Agentboard meta task. Read .agentboard/meta-task-context.md first. Use the `ab` CLI to work on the board, then handle this request: {}",
+            sanitize_prompt(&task_prompt(task))
+        );
+    }
+    task_prompt(task)
+}
+
+fn task_prompt(task: &Task) -> String {
     if task.description.is_empty() || task.description == task.title {
         sanitize_prompt(&task.title)
     } else {
@@ -434,26 +503,69 @@ pub fn start_task(store: &TaskStore, task: &Task) -> Result<Task> {
     start_task_with_options(store, task, false)
 }
 
+/// Resolve the directory for restarting or resuming a task.
+fn restart_execution_path(task: &Task) -> Result<(String, bool)> {
+    if let Some(worktree) = task
+        .worktree_path
+        .as_ref()
+        .filter(|path| std::path::Path::new(path).exists())
+    {
+        return Ok((worktree.clone(), true));
+    }
+
+    if task.is_meta && !std::path::Path::new(&task.repo_path).exists() {
+        std::fs::create_dir_all(&task.repo_path)
+            .with_context(|| format!("failed to create meta workspace {}", task.repo_path))?;
+    }
+
+    if worktree::is_git_repository(&task.repo_path)? {
+        let branch = task
+            .branch_name
+            .clone()
+            .unwrap_or_else(|| worktree::generate_branch_name(&task.id, &task.title));
+        Ok((
+            worktree::create_worktree(&task.repo_path, &task.id, &branch)?,
+            true,
+        ))
+    } else {
+        Ok((task.repo_path.clone(), false))
+    }
+}
+
 /// Start a task, optionally skipping repository setup.
 pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool) -> Result<Task> {
-    // Validate repo_path is a git repo before doing any work.
-    worktree::validate_git_repo(&task.repo_path)?;
+    if task.is_meta && !std::path::Path::new(&task.repo_path).exists() {
+        std::fs::create_dir_all(&task.repo_path)
+            .with_context(|| format!("failed to create meta workspace {}", task.repo_path))?;
+    }
 
     // Resolve configuration before creating anything, so a malformed config
-    // cannot leave behind a partially initialized worktree or session.
+    // cannot leave behind a partially initialized worktree or session. Setup
+    // applies to direct workspaces too; they are not exempt from project setup.
     let setup_config = if skip_setup {
         None
     } else {
         setup::resolve(&task.repo_path)?
     };
 
-    let branch = worktree::generate_branch_name(&task.id, &task.title);
-    let wt_path = worktree::create_worktree(&task.repo_path, &task.id, &branch)?;
+    let (execution_path, branch) = if worktree::is_git_repository(&task.repo_path)? {
+        let branch = worktree::generate_branch_name(&task.id, &task.title);
+        let wt_path = worktree::create_worktree(&task.repo_path, &task.id, &branch)?;
+        (wt_path, Some(branch))
+    } else {
+        (task.repo_path.clone(), None)
+    };
+
+    if task.is_meta {
+        write_meta_context(&execution_path, task)?;
+    }
 
     // If tmux session creation fails, clean up the worktree
     let session = tmux::session_name(&task.id);
-    if let Err(e) = tmux::create_session(&session, &wt_path) {
-        let _ = worktree::cleanup_worktree(&task.repo_path, &wt_path);
+    if let Err(e) = tmux::create_session(&session, &execution_path) {
+        if branch.is_some() {
+            let _ = worktree::cleanup_worktree(&task.repo_path, &execution_path);
+        }
         return Err(e.context("failed to create tmux session (worktree cleaned up)"));
     }
 
@@ -471,25 +583,40 @@ pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool)
 
     // Enable logging before setup starts so dependency/build output is
     // available in the session log as well as the live preview.
-    let log_path = tmux::session_log_path(&wt_path);
+    let log_path = tmux::session_log_path(&execution_path);
     if let Err(e) = tmux::enable_logging(&session, &log_path) {
         eprintln!("[start] Failed to enable session logging: {}", e);
     }
 
     if let Err(e) = tmux::send_command(&session, &cmd) {
         let _ = tmux::kill_session(&session);
-        let _ = worktree::cleanup_worktree(&task.repo_path, &wt_path);
+        if branch.is_some() {
+            let _ = worktree::cleanup_worktree(&task.repo_path, &execution_path);
+        }
         return Err(e.context("failed to spawn agent (session and worktree cleaned up)"));
     }
 
     // Update task in DB
     let mut updated = task.clone();
     updated.status = TaskStatus::Running;
-    updated.worktree_path = Some(wt_path);
-    updated.branch_name = Some(branch);
-    updated.tmux_session = Some(session);
+    updated.worktree_path = if branch.is_some() {
+        Some(execution_path)
+    } else {
+        None
+    };
+    updated.branch_name = branch;
+    updated.tmux_session = Some(session.clone());
     updated.agent_cli = Some(harness.name().to_owned());
-    store.update_task(&updated)?;
+    if let Err(e) = store.update_task(&updated) {
+        // The agent is already running, so leave no live session or newly
+        // created worktree behind if persistence fails. Direct workspaces are
+        // user-owned and intentionally remain untouched.
+        let _ = tmux::kill_session(&session);
+        if let Some(ref worktree_path) = updated.worktree_path {
+            let _ = worktree::cleanup_worktree(&task.repo_path, worktree_path);
+        }
+        return Err(e.context("failed to persist started task (session and worktree cleaned up)"));
+    }
 
     Ok(updated)
 }
@@ -506,18 +633,10 @@ pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
         let _ = tmux::kill_session(session);
     }
 
-    // Determine working directory — reuse existing worktree or create new
-    let wt_path = if let Some(ref wt) = task.worktree_path {
-        if std::path::Path::new(wt).exists() {
-            wt.clone()
-        } else {
-            let branch = task.branch_name.as_deref().unwrap_or("main");
-            worktree::create_worktree(&task.repo_path, &task.id, branch)?
-        }
-    } else {
-        let branch = worktree::generate_branch_name(&task.id, &task.title);
-        worktree::create_worktree(&task.repo_path, &task.id, &branch)?
-    };
+    let (wt_path, uses_worktree) = restart_execution_path(task)?;
+    if task.is_meta {
+        write_meta_context(&wt_path, task)?;
+    }
 
     let session = tmux::session_name(&task.id);
     if let Err(e) = tmux::create_session(&session, &wt_path) {
@@ -542,7 +661,7 @@ pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
 
     let mut updated = task.clone();
     updated.status = TaskStatus::Running;
-    updated.worktree_path = Some(wt_path);
+    updated.worktree_path = uses_worktree.then_some(wt_path);
     updated.tmux_session = Some(session);
     updated.agent_cli = Some(harness.name().to_owned());
     store.update_task(&updated)?;
@@ -565,18 +684,10 @@ pub fn resume_task(store: &TaskStore, task: &Task, desired_status: TaskStatus) -
         let _ = tmux::kill_session(session);
     }
 
-    // Determine working directory — reuse existing worktree or create new
-    let wt_path = if let Some(ref wt) = task.worktree_path {
-        if std::path::Path::new(wt).exists() {
-            wt.clone()
-        } else {
-            let branch = task.branch_name.as_deref().unwrap_or("main");
-            worktree::create_worktree(&task.repo_path, &task.id, branch)?
-        }
-    } else {
-        let branch = worktree::generate_branch_name(&task.id, &task.title);
-        worktree::create_worktree(&task.repo_path, &task.id, &branch)?
-    };
+    let (wt_path, uses_worktree) = restart_execution_path(task)?;
+    if task.is_meta {
+        write_meta_context(&wt_path, task)?;
+    }
 
     let session = tmux::session_name(&task.id);
     if let Err(e) = tmux::create_session(&session, &wt_path) {
@@ -599,7 +710,7 @@ pub fn resume_task(store: &TaskStore, task: &Task, desired_status: TaskStatus) -
 
     let mut updated = task.clone();
     updated.status = desired_status;
-    updated.worktree_path = Some(wt_path);
+    updated.worktree_path = uses_worktree.then_some(wt_path);
     updated.tmux_session = Some(session);
     updated.agent_cli = Some(harness.name().to_owned());
     store.update_task(&updated)?;
@@ -641,11 +752,12 @@ pub fn send_message(store: &TaskStore, task: &Task, message: &str) -> Result<Tas
     if !tmux::session_exists(session) {
         anyhow::bail!("tmux session '{session}' does not exist");
     }
-    if let Some(ref worktree) = task.worktree_path {
-        // Upgrade sessions created before the named agent/shell windows were
-        // introduced, including when messaging directly from the board.
-        tmux::ensure_task_windows(session, worktree)?;
-    }
+    // Upgrade sessions created before the named agent/shell windows were
+    // introduced, including direct-folder tasks.
+    tmux::ensure_task_windows(
+        session,
+        task.worktree_path.as_deref().unwrap_or(&task.repo_path),
+    )?;
     let agent_running = tmux::pane_pid(session)
         .map(|pid| {
             !harness.process_name().is_empty()
@@ -705,6 +817,8 @@ pub fn delete_task(store: &TaskStore, task: &Task) -> Result<()> {
 
     // Clean up worktree first (must happen before branch delete since the worktree checks out the branch)
     if let Some(ref wt) = task.worktree_path {
+        // Direct meta workspaces have no worktree_path and are intentionally
+        // preserved. Git-backed meta tasks do have one and must be detached.
         let _ = worktree::cleanup_worktree(&task.repo_path, wt);
     }
 
@@ -758,6 +872,7 @@ mod tests {
             description: description.to_string(),
             status: TaskStatus::Backlog,
             repo_path: "/tmp/test".to_string(),
+            is_meta: false,
             worktree_path: None,
             branch_name: None,
             tmux_session: None,
@@ -777,6 +892,35 @@ mod tests {
     fn build_prompt_title_only_when_description_matches_title() {
         let task = test_task("Fix login bug", "Fix login bug");
         assert_eq!(build_prompt(&task), "Fix login bug");
+    }
+
+    #[test]
+    fn meta_prompt_references_context_file_without_inlining_board_contract() {
+        let mut task = test_task("Review board", "Inspect the backlog");
+        task.is_meta = true;
+
+        let prompt = build_prompt(&task);
+        assert!(prompt.contains(".agentboard/meta-task-context.md"));
+        assert!(prompt.contains("Review board"));
+        assert!(prompt.contains("Inspect the backlog"));
+        assert!(!prompt.contains("ab list"));
+    }
+
+    #[test]
+    fn meta_context_file_contains_detailed_board_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = test_task("Review board", "Inspect the backlog");
+        write_meta_context(dir.path().to_str().unwrap(), &task).unwrap();
+        let context =
+            std::fs::read_to_string(dir.path().join(".agentboard/meta-task-context.md")).unwrap();
+        assert!(context.contains("ab list"));
+        assert!(context.contains("ab show <id>"));
+        assert!(context.contains("tmux capture-pane"));
+        assert!(context.contains("not the Agentboard source repository"));
+        assert!(context.contains("[--dir <path>] [--meta]"));
+        assert!(context.contains("Do not run `ab board`"));
+        assert!(!context.contains("* `ab board`"));
+        assert!(context.contains("Inspect the backlog"));
     }
 
     #[test]
