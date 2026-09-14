@@ -179,7 +179,14 @@ fn render_columns(frame: &mut Frame, app: &App, area: Rect) {
             .map(|(j, task)| {
                 let short_id: String = task.id.chars().take(8).collect();
                 let max_title_len = inner.width.saturating_sub(2) as usize;
-                let title_display = truncate_title(&task.title, max_title_len);
+                let title_display = if task.is_meta {
+                    format!(
+                        "◆ {}",
+                        truncate_title(&task.title, max_title_len.saturating_sub(2))
+                    )
+                } else {
+                    truncate_title(&task.title, max_title_len)
+                };
 
                 let is_selected = is_selected_col && j == app.selected_row;
 
@@ -276,11 +283,6 @@ fn render_detail_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         None => "",
     };
 
-    let repo_display = shorten_path(
-        &task.repo_path,
-        detail_chunks[0].width.saturating_sub(8) as usize,
-    );
-
     let mut meta_lines = vec![
         Line::from(vec![
             Span::styled("Title: ", Style::default().fg(Color::DarkGray)),
@@ -306,11 +308,22 @@ fn render_detail_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" "),
             Span::styled(alive_str, Style::default().fg(Color::Green)),
         ]),
-        Line::from(vec![
-            Span::styled("Repo:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(repo_display, Style::default().fg(Color::White)),
-        ]),
     ];
+
+    let directory_display = shorten_path(
+        &task.repo_path,
+        detail_chunks[0].width.saturating_sub(8) as usize,
+    );
+    meta_lines.push(Line::from(vec![
+        Span::styled("Dir:   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(directory_display, Style::default().fg(Color::White)),
+    ]));
+    if task.is_meta {
+        meta_lines.push(Line::from(vec![
+            Span::styled("Target:", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Agentboard board", Style::default().fg(Color::Yellow)),
+        ]));
+    }
 
     if let Some(ref branch) = task.branch_name {
         meta_lines.push(Line::from(vec![
@@ -323,7 +336,10 @@ fn render_detail_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(ref wt) = task.worktree_path {
         let wt_display = shorten_path(wt, detail_chunks[0].width.saturating_sub(8) as usize);
         meta_lines.push(Line::from(vec![
-            Span::styled("Tree:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if task.is_meta { "Work:  " } else { "Tree:  " },
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(wt_display, Style::default().fg(Color::White)),
         ]));
     }
@@ -437,7 +453,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 String::new()
             };
             Paragraph::new(format!(
-                " {} tasks{}, {} running │ Auto-refresh: {}s │ f filter repo │ ? help",
+                " {} tasks{}, {} running │ Auto-refresh: {}s │ f filter directory │ ? help",
                 total,
                 filter_hint,
                 running,
@@ -543,12 +559,16 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::raw("Create new task"),
         ]),
         Line::from(vec![
+            Span::styled("  Tab/Arrows   ", Style::default().fg(Color::Cyan)),
+            Span::raw("Navigate New Task fields and meta toggle"),
+        ]),
+        Line::from(vec![
             Span::styled("  r           ", Style::default().fg(Color::Cyan)),
             Span::raw("Refresh task list"),
         ]),
         Line::from(vec![
             Span::styled("  f           ", Style::default().fg(Color::Cyan)),
-            Span::raw("Filter by repo (cycle)"),
+            Span::raw("Filter by working directory (cycle)"),
         ]),
         Line::from(vec![
             Span::styled("  F           ", Style::default().fg(Color::Cyan)),
@@ -588,14 +608,14 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_new_task_form(frame: &mut Frame, app: &App, area: Rect) {
-    let overlay = centered_rect(60, 50, area);
+    let overlay = centered_rect(60, 60, area);
     frame.render_widget(Clear, overlay);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .title(Span::styled(
-            " New Task (Tab: next field, Ctrl+S: create, Esc: cancel) ",
+            " New Task (Tab/Arrows: navigate, Enter/Space: toggle, Ctrl+S: create) ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -607,9 +627,35 @@ fn render_new_task_form(frame: &mut Frame, app: &App, area: Rect) {
     if let InputMode::NewTask {
         ref fields,
         active_field,
+        is_meta,
+        ..
     } = app.input_mode
     {
-        render_task_form_fields(frame, fields, active_field, inner);
+        let toggle_active = active_field == fields.len();
+        let fields_area = Rect {
+            height: inner.height.saturating_sub(2),
+            ..inner
+        };
+        render_task_form_fields(frame, fields, active_field, fields_area);
+        let toggle = if is_meta {
+            "[x] Meta task — adds Agentboard board/task context"
+        } else {
+            "[ ] Meta task — adds Agentboard board/task context"
+        };
+        frame.render_widget(
+            Paragraph::new(toggle).style(Style::default().fg(if toggle_active {
+                Color::Cyan
+            } else if is_meta {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            })),
+            Rect {
+                y: inner.y + inner.height.saturating_sub(2),
+                height: 1,
+                ..inner
+            },
+        );
     }
 }
 
@@ -723,10 +769,10 @@ fn render_task_form_fields(
     active_field: usize,
     inner: Rect,
 ) {
-    // Title and Repo get a fixed single-line height; Details gets remaining space.
+    // Title and Working directory get a fixed single-line height; Details gets remaining space.
     let constraints = vec![
         Constraint::Length(3), // Title
-        Constraint::Length(3), // Repo
+        Constraint::Length(3), // Working directory
         Constraint::Min(5),    // Details — taller, with word-wrap
         Constraint::Length(0), // absorb any leftover
     ];

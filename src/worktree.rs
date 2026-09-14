@@ -4,32 +4,24 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-/// Validate that `repo_path` is inside a git repository.
+/// Return whether a working directory is a Git repository.
 ///
-/// Runs `git rev-parse --git-dir` in the given directory. Returns `Ok(())`
-/// if the path is a valid git repo (or inside one), or an actionable error
-/// message if not.
-pub fn validate_git_repo(repo_path: &str) -> Result<()> {
-    let path = std::path::Path::new(repo_path);
+/// A non-Git directory is a valid direct-agent workspace and therefore returns
+/// `Ok(false)`.
+pub fn is_git_repository(working_dir: &str) -> Result<bool> {
+    let path = std::path::Path::new(working_dir);
     if !path.exists() {
-        anyhow::bail!(
-            "Repository path '{}' does not exist. Check the --repo flag or current directory.",
-            repo_path
-        );
+        anyhow::bail!("Working directory '{}' does not exist.", working_dir);
+    }
+    if !path.is_dir() {
+        anyhow::bail!("Working directory '{}' is not a directory.", working_dir);
     }
     let output = Command::new("git")
         .args(["rev-parse", "--git-dir"])
-        .current_dir(repo_path)
+        .current_dir(working_dir)
         .output()
         .context("failed to run git — is git installed?")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "'{}' is not a git repository. Use --repo to specify a valid git repo path.",
-            repo_path
-        );
-    }
-    Ok(())
+    Ok(output.status.success())
 }
 
 /// Create a git worktree for the given task inside `repo_path/.agentboard-worktrees/<task_id>/`.
@@ -363,30 +355,10 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_git_repo_valid() {
-        let (_dir, repo_path) = make_temp_repo();
-        assert!(validate_git_repo(&repo_path).is_ok());
-    }
-
-    #[test]
-    fn test_validate_git_repo_not_a_repo() {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let path = dir.path().to_str().unwrap().to_string();
-        let err = validate_git_repo(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not a git repository"),
-            "expected git repo error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_validate_git_repo_nonexistent_path() {
-        let err = validate_git_repo("/tmp/nonexistent-agentboard-test-path-12345").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("does not exist"),
-            "expected path error, got: {msg}"
-        );
+    fn detects_git_and_direct_working_directories() {
+        let (_repo, repo_path) = make_temp_repo();
+        let direct = tempfile::tempdir().unwrap();
+        assert!(is_git_repository(&repo_path).unwrap());
+        assert!(!is_git_repository(direct.path().to_str().unwrap()).unwrap());
     }
 }

@@ -108,9 +108,10 @@ pub fn handle_normal_key(
 
                         if session_alive {
                             let session = task.tmux_session.as_ref().unwrap().clone();
-                            if let Some(ref worktree) = task.worktree_path {
-                                tmux::ensure_task_windows(&session, worktree)?;
-                            }
+                            tmux::ensure_task_windows(
+                                &session,
+                                task.worktree_path.as_deref().unwrap_or(&task.repo_path),
+                            )?;
                             restore_terminal(terminal)?;
                             let _ = tmux::attach_session(&session);
                             enable_raw_mode().context("failed to re-enable raw mode")?;
@@ -144,9 +145,13 @@ pub fn handle_normal_key(
                                     if let Some(ref session) = updated.tmux_session {
                                         if tmux::session_exists(session) {
                                             let session = session.clone();
-                                            if let Some(ref worktree) = updated.worktree_path {
-                                                tmux::ensure_task_windows(&session, worktree)?;
-                                            }
+                                            tmux::ensure_task_windows(
+                                                &session,
+                                                updated
+                                                    .worktree_path
+                                                    .as_deref()
+                                                    .unwrap_or(&updated.repo_path),
+                                            )?;
                                             restore_terminal(terminal)?;
                                             let _ = tmux::attach_session(&session);
                                             enable_raw_mode()
@@ -209,9 +214,9 @@ pub fn handle_normal_key(
                         cursor_pos: 0,
                     },
                     InputField {
-                        label: "Repo",
+                        label: "Working directory",
                         value: default_repo,
-                        placeholder: "/path/to/repo",
+                        placeholder: "/path/to/directory",
                         cursor_pos: default_repo_len,
                     },
                     InputField {
@@ -222,6 +227,8 @@ pub fn handle_normal_key(
                     },
                 ],
                 active_field: 0,
+                is_meta: false,
+                previous_working_directory: None,
             };
         }
 
@@ -290,9 +297,9 @@ pub fn handle_normal_key(
                                 cursor_pos: title_len,
                             },
                             InputField {
-                                label: "Repo",
+                                label: "Working directory",
                                 value: task.repo_path.clone(),
-                                placeholder: "/path/to/repo",
+                                placeholder: "/path/to/directory",
                                 cursor_pos: repo_len,
                             },
                             InputField {
@@ -323,7 +330,7 @@ pub fn handle_normal_key(
             app.show_help = true;
         }
 
-        // Repo filter: cycle through repos
+        // Working-directory filter: cycle through known directories.
         KeyCode::Char('f') => {
             app.cycle_repo_filter();
             let msg = match &app.repo_filter {
@@ -336,7 +343,7 @@ pub fn handle_normal_key(
             app.notify(Notification::info(msg));
         }
 
-        // Repo filter: clear
+        // Working-directory filter: clear
         KeyCode::Char('F') => {
             app.clear_repo_filter();
             app.notify(Notification::info("Filter cleared — showing all repos"));
@@ -361,19 +368,21 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
             if let InputMode::NewTask {
                 ref fields,
                 ref mut active_field,
+                ..
             } = app.input_mode
             {
-                *active_field = (*active_field + 1) % fields.len();
+                *active_field = (*active_field + 1) % (fields.len() + 1);
             }
         }
         KeyCode::BackTab | KeyCode::Up => {
             if let InputMode::NewTask {
                 ref fields,
                 ref mut active_field,
+                ..
             } = app.input_mode
             {
                 *active_field = if *active_field == 0 {
-                    fields.len() - 1
+                    fields.len()
                 } else {
                     *active_field - 1
                 };
@@ -384,6 +393,8 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             submit_new_task(app)?;
         }
+        KeyCode::Enter if new_task_toggle_is_active(app) => app.toggle_new_task_meta()?,
+        KeyCode::Char(' ') if new_task_toggle_is_active(app) => app.toggle_new_task_meta()?,
         KeyCode::Enter if !details_field_is_active(app) => submit_new_task(app)?,
         // Some terminals or multiplexers do not pass bracketed-paste
         // sequences through. Treat a plain Enter in Details as text so a
@@ -392,18 +403,24 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
             if let InputMode::NewTask {
                 ref mut fields,
                 active_field,
+                ..
             } = app.input_mode
             {
-                handle_field_paste(&mut fields[active_field], "\n");
+                if active_field < fields.len() {
+                    handle_field_paste(&mut fields[active_field], "\n");
+                }
             }
         }
         _ => {
             if let InputMode::NewTask {
                 ref mut fields,
                 active_field,
+                ..
             } = app.input_mode
             {
-                handle_field_key(&mut fields[active_field], key.code);
+                if active_field < fields.len() {
+                    handle_field_key(&mut fields[active_field], key.code);
+                }
             }
         }
     }
@@ -418,14 +435,33 @@ pub fn handle_new_task_paste(app: &mut App, text: &str) {
     if let InputMode::NewTask {
         ref mut fields,
         active_field,
+        ..
     } = app.input_mode
     {
-        handle_field_paste(&mut fields[active_field], text);
+        if active_field < fields.len() {
+            handle_field_paste(&mut fields[active_field], text);
+        }
     }
 }
 
+fn new_task_toggle_is_active(app: &App) -> bool {
+    matches!(
+        &app.input_mode,
+        InputMode::NewTask {
+            fields,
+            active_field,
+            ..
+        } if *active_field == fields.len()
+    )
+}
+
 fn submit_new_task(app: &mut App) -> Result<()> {
-    if let InputMode::NewTask { ref fields, .. } = app.input_mode {
+    if let InputMode::NewTask {
+        ref fields,
+        is_meta,
+        ..
+    } = app.input_mode
+    {
         let title = fields[0].value.trim().to_string();
         let repo = fields[1].value.trim().to_string();
         let description = fields[2].value.trim().to_string();
@@ -433,7 +469,7 @@ fn submit_new_task(app: &mut App) -> Result<()> {
             app.notify(Notification::warn("Title cannot be empty"));
         } else {
             app.input_mode = InputMode::Normal;
-            app.create_new_task(&title, &description, &repo)?;
+            app.create_new_task(&title, &description, &repo, is_meta)?;
         }
     }
     Ok(())
