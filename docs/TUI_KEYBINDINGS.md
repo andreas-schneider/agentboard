@@ -7,7 +7,7 @@
 | Key | Action |
 |-----|--------|
 | `h`/`l` or `←`/`→` | Move between columns |
-| `j`/`k` or `↓`/`↑` | Move between tasks |
+| `j` or `↓`/`↑` | Move between tasks (`k` sends a task to Keep) |
 | `Tab`/`Shift+Tab` | Cycle columns |
 | `[`/`]` | Scroll live preview |
 
@@ -15,15 +15,24 @@
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Start (backlog) / Attach or auto-resume (running/blocked/done) |
+| `Enter` | Start (backlog) / Attach or auto-resume (running/blocked/done/keep) |
 | `s` | Start selected backlog task |
 | `e` | Edit backlog task (title, description, working directory) |
 | `m` | Send a message to an agent (running/blocked) |
 | `p` | Open the quick prompts palette |
 | `K` | Kill a running task (with confirmation) |
 | `D` | Mark a task as done |
-| `R` | Restart a blocked/done task |
+| `R` | Restart a blocked/done/keep task |
+| `k` | Send the selected task to the Keep lane |
+| `v` | Show or hide the Keep lane |
 | `x` | Delete a task (with confirmation) |
+
+The **Keep** lane is a parked column for unfinished work that is neither
+blocked nor done — for example a sketch of an idea worth revisiting later. It
+is hidden by default; press `v` to reveal it and `v` again to hide it. Press
+`k` to send the selected task there from any other lane. Keep sorts like Done
+(most recently updated first), and a kept task can be revealed and resumed
+later with `Enter` or restarted with `R`.
 
 ### General
 

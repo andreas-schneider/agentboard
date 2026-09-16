@@ -14,13 +14,17 @@ pub enum TaskStatus {
     Running,
     Blocked,
     Done,
+    /// A parked lane for unfinished work that is neither blocked nor done —
+    /// e.g. a sketch of an idea worth revisiting later. Hidden on the board
+    /// unless the user reveals it.
+    Keep,
 }
 
 impl TaskStatus {
     /// Returns the ordered list of kanban column names.
     #[allow(dead_code)]
     pub fn all_columns() -> &'static [&'static str] {
-        &["Backlog", "Running", "Blocked", "Done"]
+        &["Backlog", "Running", "Blocked", "Done", "Keep"]
     }
 }
 
@@ -31,6 +35,7 @@ impl fmt::Display for TaskStatus {
             TaskStatus::Running => "Running",
             TaskStatus::Blocked => "Blocked",
             TaskStatus::Done => "Done",
+            TaskStatus::Keep => "Keep",
         };
         write!(f, "{}", s)
     }
@@ -47,6 +52,7 @@ impl FromStr for TaskStatus {
             // Migrate old statuses to Blocked
             "Finished" | "Failed" => Ok(TaskStatus::Blocked),
             "Done" => Ok(TaskStatus::Done),
+            "Keep" => Ok(TaskStatus::Keep),
             other => Err(anyhow!("unknown task status: {}", other)),
         }
     }
