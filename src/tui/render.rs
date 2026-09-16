@@ -67,6 +67,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let running_count = app.tasks_in_column(&TaskStatus::Running).len();
     let blocked_count = app.tasks_in_column(&TaskStatus::Blocked).len();
     let done_count = app.tasks_in_column(&TaskStatus::Done).len();
+    let keep_count = app.tasks_in_column(&TaskStatus::Keep).len();
 
     let mut spans = vec![
         Span::styled(
@@ -127,6 +128,14 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Cyan),
         ),
     ]);
+
+    if app.show_keep {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("◇ {} keep", keep_count),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
 
     let header = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(header, area);
@@ -493,8 +502,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::raw("Move between columns"),
         ]),
         Line::from(vec![
-            Span::styled("  j/k ↓/↑    ", Style::default().fg(Color::Cyan)),
-            Span::raw("Move between tasks"),
+            Span::styled("  j / ↓ ↑    ", Style::default().fg(Color::Cyan)),
+            Span::raw("Move between tasks (k is now Keep)"),
         ]),
         Line::from(vec![
             Span::styled("  Tab/S-Tab   ", Style::default().fg(Color::Cyan)),
@@ -538,6 +547,14 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  D           ", Style::default().fg(Color::Cyan)),
             Span::raw("Mark task as done"),
+        ]),
+        Line::from(vec![
+            Span::styled("  k           ", Style::default().fg(Color::Cyan)),
+            Span::raw("Send task to the Keep lane (park an idea)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  v           ", Style::default().fg(Color::Cyan)),
+            Span::raw("Show / hide the Keep lane"),
         ]),
         Line::from(vec![
             Span::styled("  R           ", Style::default().fg(Color::Cyan)),
@@ -1084,6 +1101,7 @@ pub fn color_for_status(status: &TaskStatus) -> Color {
         TaskStatus::Running => Color::Green,
         TaskStatus::Blocked => Color::Yellow,
         TaskStatus::Done => Color::Cyan,
+        TaskStatus::Keep => Color::Magenta,
     }
 }
 
