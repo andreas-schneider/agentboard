@@ -927,11 +927,23 @@ fn render_edit_task_form(frame: &mut Frame, app: &App, area: Rect) {
     let overlay = centered_rect(60, 50, area);
     frame.render_widget(Clear, overlay);
 
+    // Single-field (title-only) edits have nothing to tab between and no
+    // reason for a separate save chord, so show the simpler hint.
+    let single_field = matches!(
+        &app.input_mode,
+        InputMode::EditTask { fields, .. } if fields.len() <= 1
+    );
+    let title = if single_field {
+        " Edit Task (Enter: save, Esc: cancel) "
+    } else {
+        " Edit Task (Tab: next field, Ctrl+S: save, Esc: cancel) "
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
-            " Edit Task (Tab: next field, Ctrl+S: save, Esc: cancel) ",
+            title,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
