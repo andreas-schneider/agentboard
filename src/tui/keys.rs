@@ -59,11 +59,26 @@ pub fn handle_normal_key(
                 app.capture_detail();
             }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Up => {
             if app.selected_row > 0 {
                 app.selected_row -= 1;
                 app.capture_detail();
             }
+        }
+
+        // Send the selected task to the hidden "Keep" lane.
+        KeyCode::Char('k') => {
+            app.keep_task()?;
+        }
+
+        // Show or hide the "Keep" lane.
+        KeyCode::Char('v') => {
+            app.toggle_keep_lane();
+            app.notify(Notification::info(if app.show_keep {
+                "Keep lane shown"
+            } else {
+                "Keep lane hidden"
+            }));
         }
 
         // Tab cycles columns forward, Shift+Tab backward (BackTab)
@@ -100,7 +115,10 @@ pub fn handle_normal_key(
         KeyCode::Enter => {
             if let Some(task) = app.selected_task() {
                 match task.status {
-                    TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done => {
+                    TaskStatus::Running
+                    | TaskStatus::Blocked
+                    | TaskStatus::Done
+                    | TaskStatus::Keep => {
                         let session_alive = task
                             .tmux_session
                             .as_ref()
@@ -129,7 +147,7 @@ pub fn handle_normal_key(
                             // Blocked when the agent finishes. Running/Blocked keep
                             // their current status.
                             let desired_status = match task.status {
-                                TaskStatus::Done => TaskStatus::Running,
+                                TaskStatus::Done | TaskStatus::Keep => TaskStatus::Running,
                                 ref other => other.clone(),
                             };
                             match orchestrator::resume_task(&app.store, &task_clone, desired_status)

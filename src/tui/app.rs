@@ -167,6 +167,9 @@ pub struct App {
     // Help overlay
     pub show_help: bool,
 
+    // Whether the hidden "Keep" lane is currently shown as a column.
+    pub show_keep: bool,
+
     // Working-directory filter: when Some, only matching tasks are shown.
     pub repo_filter: Option<String>,
 }
@@ -197,6 +200,7 @@ impl App {
             notification: None,
             input_mode: InputMode::Normal,
             show_help: false,
+            show_keep: false,
             repo_filter,
         })
     }
@@ -224,8 +228,9 @@ impl App {
                     .then_with(|| a.id.cmp(&b.id))
             }),
             // Surface the task with the most recent activity, problem, or
-            // completion first.
-            TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done => {
+            // completion first. Keep is a parked lane that sorts like Done so
+            // the most recently kept idea stays at the top.
+            TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done | TaskStatus::Keep => {
                 tasks.sort_by(|a, b| {
                     b.updated_at
                         .cmp(&a.updated_at)
@@ -488,10 +493,16 @@ impl App {
 
     pub fn restart_task(&mut self) -> Result<()> {
         let task = match self.selected_task() {
-            Some(t) if t.status == TaskStatus::Blocked || t.status == TaskStatus::Done => t.clone(),
+            Some(t)
+                if t.status == TaskStatus::Blocked
+                    || t.status == TaskStatus::Done
+                    || t.status == TaskStatus::Keep =>
+            {
+                t.clone()
+            }
             Some(t) => {
                 self.notify(Notification::warn(format!(
-                    "Can only restart Blocked/Done tasks (this is {})",
+                    "Can only restart Blocked/Done/Keep tasks (this is {})",
                     t.status
                 )));
                 return Ok(());
@@ -535,6 +546,52 @@ impl App {
             &updated.id[..8]
         )));
         Ok(())
+    }
+
+    /// Park the selected task in the hidden "Keep" lane. A kept task keeps its
+    /// worktree and session but is set aside; it can be revealed and resumed
+    /// later just like a Done task.
+    pub fn keep_task(&mut self) -> Result<()> {
+        let task = match self.selected_task() {
+            Some(t) if t.status == TaskStatus::Keep => {
+                self.notify(Notification::info("Task is already in Keep"));
+                return Ok(());
+            }
+            Some(t) => t.clone(),
+            None => return Ok(()),
+        };
+        self.store.update_status(&task.id, TaskStatus::Keep)?;
+        self.refresh_now()?;
+        let where_to = if self.show_keep {
+            "moved to Keep"
+        } else {
+            "kept (press v to show the Keep lane)"
+        };
+        self.notify(Notification::info(format!(
+            "Task {} {}",
+            &task.id[..8],
+            where_to
+        )));
+        Ok(())
+    }
+
+    /// Show or hide the "Keep" lane. When hidden, the selected column is
+    /// clamped back into the visible range so navigation stays valid.
+    pub fn toggle_keep_lane(&mut self) {
+        self.show_keep = !self.show_keep;
+        if self.show_keep {
+            if !self.columns.contains(&TaskStatus::Keep) {
+                self.columns.push(TaskStatus::Keep);
+            }
+        } else {
+            self.columns.retain(|c| *c != TaskStatus::Keep);
+            if self.selected_column >= self.columns.len() {
+                self.selected_column = self.columns.len().saturating_sub(1);
+            }
+            self.selected_row = 0;
+        }
+        self.clamp_row();
+        self.capture_detail();
     }
 
     pub fn delete_task(&mut self, id: &str) -> Result<()> {
@@ -707,6 +764,7 @@ impl App {
                     TaskStatus::Backlog => {
                         actions.push(("Enter/s", "start"));
                         actions.push(("e", "edit"));
+                        actions.push(("k", "keep"));
                         actions.push(("x", "delete"));
                     }
                     TaskStatus::Running => {
@@ -715,6 +773,7 @@ impl App {
                         actions.push(("p", "prompts"));
                         actions.push(("K", "kill"));
                         actions.push(("D", "done"));
+                        actions.push(("k", "keep"));
                     }
                     TaskStatus::Blocked => {
                         actions.push(("Enter", "attach"));
@@ -722,9 +781,16 @@ impl App {
                         actions.push(("p", "prompts"));
                         actions.push(("D", "done"));
                         actions.push(("R", "restart"));
+                        actions.push(("k", "keep"));
                         actions.push(("x", "delete"));
                     }
                     TaskStatus::Done => {
+                        actions.push(("Enter", "attach"));
+                        actions.push(("R", "restart"));
+                        actions.push(("k", "keep"));
+                        actions.push(("x", "delete"));
+                    }
+                    TaskStatus::Keep => {
                         actions.push(("Enter", "attach"));
                         actions.push(("R", "restart"));
                         actions.push(("x", "delete"));
@@ -811,6 +877,18 @@ mod tests {
             "2026-01-02T00:00:00Z",
             "2026-01-06T00:00:00Z",
         );
+        let keep_old = task(
+            "keep-old",
+            TaskStatus::Keep,
+            "2026-01-01T00:00:00Z",
+            "2026-01-04T00:00:00Z",
+        );
+        let keep_recent = task(
+            "keep-recent",
+            TaskStatus::Keep,
+            "2026-01-02T00:00:00Z",
+            "2026-01-07T00:00:00Z",
+        );
 
         let app = App {
             tasks: vec![
@@ -822,6 +900,8 @@ mod tests {
                 blocked_recent,
                 done_old,
                 done_recent,
+                keep_old,
+                keep_recent,
             ],
             selected_column: 0,
             selected_row: 0,
@@ -838,6 +918,7 @@ mod tests {
             notification: None,
             input_mode: InputMode::Normal,
             show_help: false,
+            show_keep: false,
             repo_filter: None,
         };
 
@@ -852,5 +933,50 @@ mod tests {
         assert_eq!(ids(TaskStatus::Running), ["running-recent", "running-old"]);
         assert_eq!(ids(TaskStatus::Blocked), ["blocked-recent", "blocked-old"]);
         assert_eq!(ids(TaskStatus::Done), ["done-recent", "done-old"]);
+        // Keep sorts like Done: most recently updated first.
+        assert_eq!(ids(TaskStatus::Keep), ["keep-recent", "keep-old"]);
+    }
+
+    #[test]
+    fn keep_lane_toggles_visibility_and_clamps_selection() {
+        let mut app = App::new(TaskStore::open_in_memory().unwrap(), None).unwrap();
+
+        // Keep lane starts hidden and is not among the visible columns.
+        assert!(!app.show_keep);
+        assert!(!app.columns.contains(&TaskStatus::Keep));
+        let base_columns = app.columns.len();
+
+        // Select the last visible column, then reveal Keep.
+        app.selected_column = base_columns - 1;
+        app.toggle_keep_lane();
+        assert!(app.show_keep);
+        assert_eq!(app.columns.last(), Some(&TaskStatus::Keep));
+        assert_eq!(app.columns.len(), base_columns + 1);
+
+        // Move onto the Keep column, then hide it — selection must clamp back
+        // into the remaining visible columns.
+        app.selected_column = app.columns.len() - 1;
+        app.toggle_keep_lane();
+        assert!(!app.show_keep);
+        assert!(!app.columns.contains(&TaskStatus::Keep));
+        assert!(app.selected_column < app.columns.len());
+    }
+
+    #[test]
+    fn keep_task_moves_selected_task_to_keep_lane() {
+        let mut app = App::new(TaskStore::open_in_memory().unwrap(), None).unwrap();
+        let created = app
+            .store
+            .create_task("Idea sketch", "revisit later", "/tmp/repo")
+            .unwrap();
+        app.refresh_now().unwrap();
+
+        // Backlog column is first; select the new task and keep it.
+        app.selected_column = 0;
+        app.selected_row = 0;
+        app.keep_task().unwrap();
+
+        let fetched = app.store.get_task(&created.id).unwrap();
+        assert_eq!(fetched.status, TaskStatus::Keep);
     }
 }
