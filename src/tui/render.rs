@@ -521,7 +521,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  e           ", Style::default().fg(Color::Cyan)),
-            Span::raw("Edit backlog task"),
+            Span::raw("Edit task (title; all fields for Backlog)"),
         ]),
         Line::from(vec![
             Span::styled("  m           ", Style::default().fg(Color::Cyan)),
