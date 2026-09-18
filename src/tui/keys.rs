@@ -390,7 +390,8 @@ pub fn handle_normal_key(
 pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
-            app.input_mode = InputMode::Normal;
+            // Closing the New Task dialog now auto-saves the task (no separate save key).
+            submit_new_task(app)?;
         }
         KeyCode::Tab | KeyCode::Down => {
             if let InputMode::NewTask {
@@ -399,7 +400,8 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 ..
             } = app.input_mode
             {
-                *active_field = (*active_field + 1) % (fields.len() + 1);
+                // Extra slot at fields.len()+1 represents the dialog-level focus
+                *active_field = (*active_field + 1) % (fields.len() + 2);
             }
         }
         KeyCode::BackTab | KeyCode::Up => {
@@ -410,7 +412,7 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
             } = app.input_mode
             {
                 *active_field = if *active_field == 0 {
-                    fields.len()
+                    fields.len() + 1
                 } else {
                     *active_field - 1
                 };
@@ -423,19 +425,28 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Enter if new_task_toggle_is_active(app) => app.toggle_new_task_meta()?,
         KeyCode::Char(' ') if new_task_toggle_is_active(app) => app.toggle_new_task_meta()?,
-        KeyCode::Enter if !details_field_is_active(app) => submit_new_task(app)?,
+        // Enter only submits when the dialog as a whole is active. If a single
+        // non-Details field is active, move focus forward instead. Enter in
+        // Details inserts a newline so multi-line input works as expected.
+        KeyCode::Enter if new_task_dialog_is_active(app) => submit_new_task(app)?,
         // Some terminals or multiplexers do not pass bracketed-paste
         // sequences through. Treat a plain Enter in Details as text so a
-        // multi-line paste can never create a task mid-paste.
+        // multi-line paste can never create a task mid-paste. For other
+        // single-line fields, treat Enter like Tab (advance focus).
         KeyCode::Enter => {
             if let InputMode::NewTask {
                 ref mut fields,
-                active_field,
+                ref mut active_field,
                 ..
             } = app.input_mode
             {
-                if active_field < fields.len() {
-                    handle_field_paste(&mut fields[active_field], "\n");
+                // Determine if the active slot is the Details multi-line field
+                let is_details = *active_field == 2 && *active_field < fields.len();
+                if is_details {
+                    handle_field_paste(&mut fields[*active_field], "\n");
+                } else {
+                    // Advance focus to next slot (may wrap to dialog-level)
+                    *active_field = (*active_field + 1) % (fields.len() + 2);
                 }
             }
         }
@@ -480,6 +491,18 @@ fn new_task_toggle_is_active(app: &App) -> bool {
             active_field,
             ..
         } if *active_field == fields.len()
+    )
+}
+
+/// Dialog-level focus: when the active_field is one past the toggle index.
+fn new_task_dialog_is_active(app: &App) -> bool {
+    matches!(
+        &app.input_mode,
+        InputMode::NewTask {
+            fields,
+            active_field,
+            ..
+        } if *active_field == fields.len() + 1
     )
 }
 

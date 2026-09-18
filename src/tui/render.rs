@@ -632,7 +632,7 @@ fn render_new_task_form(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .title(Span::styled(
-            " New Task (Tab/Arrows: navigate, Enter/Space: toggle, Ctrl+S: create) ",
+            " New Task (Tab/Arrows: navigate, Space: toggle, Enter/Esc: save) ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
