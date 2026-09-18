@@ -297,41 +297,51 @@ pub fn handle_normal_key(
             app.mark_done()?;
         }
 
-        // Edit backlog task
+        // Edit task (title for any lane; full form for Backlog)
         KeyCode::Char('e') => {
             if let Some(task) = app.selected_task() {
-                if task.status == TaskStatus::Backlog {
-                    let task = task.clone();
-                    let title_len = task.title.len();
+                let task = task.clone();
+                let title_len = task.title.len();
+                // Backlog tasks have no worktree/agent yet, so every field is
+                // safe to edit. Once a task has started, its working directory
+                // and initial prompt (Details) are already consumed, so we only
+                // allow renaming the task.
+                let fields = if task.status == TaskStatus::Backlog {
                     let repo_len = task.repo_path.len();
                     let desc_len = task.description.len();
-                    app.input_mode = InputMode::EditTask {
-                        task_id: task.id.clone(),
-                        fields: vec![
-                            InputField {
-                                label: "Title",
-                                value: task.title.clone(),
-                                placeholder: "Short task description",
-                                cursor_pos: title_len,
-                            },
-                            InputField {
-                                label: "Working directory",
-                                value: task.repo_path.clone(),
-                                placeholder: "/path/to/directory",
-                                cursor_pos: repo_len,
-                            },
-                            InputField {
-                                label: "Details",
-                                value: task.description.clone(),
-                                placeholder: "Detailed prompt for the agent (optional)",
-                                cursor_pos: desc_len,
-                            },
-                        ],
-                        active_field: 0,
-                    };
+                    vec![
+                        InputField {
+                            label: "Title",
+                            value: task.title.clone(),
+                            placeholder: "Short task description",
+                            cursor_pos: title_len,
+                        },
+                        InputField {
+                            label: "Working directory",
+                            value: task.repo_path.clone(),
+                            placeholder: "/path/to/directory",
+                            cursor_pos: repo_len,
+                        },
+                        InputField {
+                            label: "Details",
+                            value: task.description.clone(),
+                            placeholder: "Detailed prompt for the agent (optional)",
+                            cursor_pos: desc_len,
+                        },
+                    ]
                 } else {
-                    app.notify(Notification::warn("Can only edit Backlog tasks"));
-                }
+                    vec![InputField {
+                        label: "Title",
+                        value: task.title.clone(),
+                        placeholder: "Short task description",
+                        cursor_pos: title_len,
+                    }]
+                };
+                app.input_mode = InputMode::EditTask {
+                    task_id: task.id.clone(),
+                    fields,
+                    active_field: 0,
+                };
             }
         }
 
@@ -578,8 +588,17 @@ fn submit_edit_task(app: &mut App) -> Result<()> {
     {
         let task_id = task_id.clone();
         let title = fields[0].value.trim().to_string();
-        let repo = fields[1].value.trim().to_string();
-        let description = fields[2].value.trim().to_string();
+        // Started tasks show a title-only form; fall back to the task's
+        // existing working directory and details so they are preserved.
+        let existing = app.tasks.iter().find(|t| t.id == task_id);
+        let repo = match fields.get(1) {
+            Some(field) => field.value.trim().to_string(),
+            None => existing.map(|t| t.repo_path.clone()).unwrap_or_default(),
+        };
+        let description = match fields.get(2) {
+            Some(field) => field.value.trim().to_string(),
+            None => existing.map(|t| t.description.clone()).unwrap_or_default(),
+        };
         if title.is_empty() {
             app.notify(Notification::warn("Title cannot be empty"));
         } else {
