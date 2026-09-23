@@ -517,7 +517,11 @@ fn submit_new_task(app: &mut App) -> Result<()> {
         let repo = fields[1].value.trim().to_string();
         let description = fields[2].value.trim().to_string();
         if title.is_empty() {
-            app.notify(Notification::warn("Title cannot be empty"));
+            if description.is_empty() {
+                app.input_mode = InputMode::Normal;
+            } else {
+                app.notify(Notification::warn("Title cannot be empty"));
+            }
         } else {
             app.input_mode = InputMode::Normal;
             app.create_new_task(&title, &description, &repo, is_meta)?;
@@ -863,8 +867,10 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::handle_field_paste;
-    use crate::tui::app::InputField;
+    use super::{handle_field_paste, handle_new_task_key};
+    use crate::store::TaskStore;
+    use crate::tui::app::{App, InputField, InputMode};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn paste_inserts_multiline_text_at_cursor_without_losing_unicode() {
@@ -882,5 +888,45 @@ mod tests {
             field.cursor_pos,
             "before first line\nsecond 🚀\nthird".len()
         );
+    }
+
+    #[test]
+    fn submitting_empty_new_task_closes_form_without_creating_task() {
+        let store = TaskStore::open_in_memory().unwrap();
+        let mut app = App::new(store, None).unwrap();
+        app.input_mode = InputMode::NewTask {
+            fields: vec![
+                InputField {
+                    label: "Title",
+                    value: String::new(),
+                    placeholder: "",
+                    cursor_pos: 0,
+                },
+                InputField {
+                    label: "Working directory",
+                    value: String::new(),
+                    placeholder: "",
+                    cursor_pos: 0,
+                },
+                InputField {
+                    label: "Details",
+                    value: String::new(),
+                    placeholder: "",
+                    cursor_pos: 0,
+                },
+            ],
+            active_field: 0,
+            is_meta: false,
+            previous_working_directory: None,
+        };
+
+        handle_new_task_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.tasks.is_empty());
     }
 }
