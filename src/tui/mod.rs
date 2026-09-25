@@ -104,9 +104,6 @@ pub fn run_board(repo_filter: Option<String>) -> Result<()> {
             } else {
                 app.notify(app::Notification::info(msg));
             }
-
-            // Reload tasks after restoration changed statuses
-            app.refresh_now()?;
         }
         Err(e) => {
             eprintln!("[restore] Failed to check for orphaned tasks: {}", e);
@@ -114,8 +111,9 @@ pub fn run_board(repo_filter: Option<String>) -> Result<()> {
         _ => {}
     }
 
-    app.check_sessions();
-    app.capture_detail();
+    // Reconcile persisted task states before the first board frame. An idle
+    // agent may have finished while no board process was running.
+    app.refresh_now()?;
     let mut terminal = setup_terminal()?;
 
     let result = run_event_loop(&mut terminal, &mut app);
