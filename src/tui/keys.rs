@@ -131,7 +131,9 @@ pub fn handle_normal_key(
                                 task.worktree_path.as_deref().unwrap_or(&task.repo_path),
                             )?;
                             restore_terminal(terminal)?;
-                            let _ = tmux::attach_session(&session);
+                            let _ = tmux::attach_session_with_poll(&session, || {
+                                let _ = app.refresh_now();
+                            });
                             enable_raw_mode().context("failed to re-enable raw mode")?;
                             execute!(io::stdout(), EnterAlternateScreen)
                                 .context("failed to re-enter alternate screen")?;
@@ -171,7 +173,10 @@ pub fn handle_normal_key(
                                                     .unwrap_or(&updated.repo_path),
                                             )?;
                                             restore_terminal(terminal)?;
-                                            let _ = tmux::attach_session(&session);
+                                            let _ =
+                                                tmux::attach_session_with_poll(&session, || {
+                                                    let _ = app.refresh_now();
+                                                });
                                             enable_raw_mode()
                                                 .context("failed to re-enable raw mode")?;
                                             execute!(io::stdout(), EnterAlternateScreen)

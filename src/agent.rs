@@ -234,10 +234,22 @@ impl AgentHarness for CodexHarness {
     }
 
     fn is_active(&self, visible: &str) -> bool {
-        // Codex renders `• Working (... • esc to interrupt)` immediately
-        // above its composer. Match the status-line structure near the bottom
-        // instead of those words anywhere in the transcript.
-        visible.lines().rev().take(8).any(|line| {
+        // The Working line sits immediately above the composer while Codex
+        // is active. A completed reply can leave a recent Working line in the
+        // visible transcript, so its position matters as well as its text.
+        let bottom: Vec<&str> = visible
+            .lines()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(8)
+            .collect();
+        let Some(composer) = bottom
+            .iter()
+            .position(|line| line.trim_start().starts_with('›'))
+        else {
+            return false;
+        };
+        bottom.get(composer + 1).is_some_and(|line| {
             let line = line.trim_start().to_lowercase();
             line.starts_with("• working (") && line.contains("esc to interrupt")
         })
@@ -407,9 +419,13 @@ mod tests {
     fn codex_idle_state_ignores_always_visible_composer() {
         let harness = CodexHarness;
         assert!(harness.is_idle("› task text\n\n  gpt-5.6-luna medium"));
-        assert!(!harness.is_idle("› task text\n\n• Working (5s • esc to interrupt)"));
+        assert!(!harness
+            .is_idle("• Working (5s • esc to interrupt)\n\n› Ask Codex to do anything\n\n  model"));
         assert!(harness.is_idle(
             "The answer mentions Working (5s • esc to interrupt) in prose.\n\n› Ask Codex to do anything\n\nmodel"
+        ));
+        assert!(harness.is_idle(
+            "• Working (5s • esc to interrupt)\n\n• I need your input before continuing.\n\n› Ask Codex to do anything\n\nmodel"
         ));
         assert!(harness
             .is_idle("• Working (old • esc to interrupt)\n1\n2\n3\n4\n5\n6\n7\n8\n› Ask Codex"));

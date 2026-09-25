@@ -282,6 +282,30 @@ pub fn attach_session(session: &str) -> Result<()> {
     Ok(())
 }
 
+/// Attach to a task while continuing to run the board's activity checks.
+/// The board's normal event loop is paused for the duration of the attach.
+pub fn attach_session_with_poll(session: &str, mut poll: impl FnMut()) -> Result<()> {
+    let target = agent_target(session);
+    let mut child = Command::new("tmux")
+        .args(["attach-session", "-t", &target])
+        .spawn()
+        .context("failed to spawn tmux attach-session")?;
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to wait for tmux attach-session")?
+        {
+            if !status.success() {
+                anyhow::bail!("tmux attach-session exited with status {status}");
+            }
+            return Ok(());
+        }
+        poll();
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
 /// Kill a tmux session.
 ///
 /// Returns `Ok(())` if the session was killed or if it did not exist (already
@@ -449,7 +473,7 @@ pub fn has_agent_descendant(root_pid: u32, needle: &str) -> bool {
 
         // Check the root too. Depending on how the shell launches the agent,
         // the pane PID can itself be the agent or its sandbox launcher.
-        if process_matches(pid, &needle_lower) {
+        if !is_kiro_terminal_wrapper(pid) && process_matches(pid, &needle_lower) {
             return true;
         }
 
@@ -476,7 +500,7 @@ pub fn has_agent_descendant(root_pid: u32, needle: &str) -> bool {
         };
 
         for cpid in child_pids {
-            if process_matches(cpid, &needle_lower) {
+            if !is_kiro_terminal_wrapper(cpid) && process_matches(cpid, &needle_lower) {
                 return true;
             }
             to_visit.push(cpid);
@@ -488,10 +512,11 @@ pub fn has_agent_descendant(root_pid: u32, needle: &str) -> bool {
 
 /// Identify which supported agent owns a pane process tree.
 ///
-/// Process identity is checked across the whole tree before command-line
-/// substrings. That ordering matters because an agent's prompt can itself
-/// mention another supported CLI. The substring pass remains as a portability
-/// fallback for launchers whose executable name hides the wrapped program.
+/// Exact process identity is checked across the whole tree before command-line
+/// substrings. The pane's `kiro-cli-term` parent is a terminal wrapper even
+/// when Codex owns the session, so a prefix match would pick the wrong agent.
+/// The substring pass remains as a portability fallback for launchers whose
+/// executable name hides the wrapped program.
 pub fn detect_agent_descendant<'a>(root_pid: u32, candidates: &'a [&str]) -> Option<&'a str> {
     let pids = descendant_pids(root_pid);
 
@@ -504,6 +529,9 @@ pub fn detect_agent_descendant<'a>(root_pid: u32, candidates: &'a [&str]) -> Opt
     }
 
     for pid in pids {
+        if is_kiro_terminal_wrapper(pid) {
+            continue;
+        }
         for &candidate in candidates {
             if process_matches(pid, &candidate.to_lowercase()) {
                 return Some(candidate);
@@ -549,7 +577,7 @@ fn descendant_pids(root_pid: u32) -> Vec<u32> {
 fn process_identity_matches(pid: u32, needle_lower: &str) -> bool {
     let comm_path = format!("/proc/{pid}/comm");
     if std::fs::read_to_string(comm_path)
-        .map(|comm| comm.to_lowercase().contains(needle_lower))
+        .map(|comm| process_name_matches_exact(&comm, needle_lower))
         .unwrap_or(false)
     {
         return true;
@@ -567,8 +595,18 @@ fn process_identity_matches(pid: u32, needle_lower: &str) -> bool {
         .and_then(|argv0| {
             std::path::Path::new(&argv0)
                 .file_name()
-                .map(|name| name.to_string_lossy().contains(needle_lower))
+                .map(|name| process_name_matches_exact(&name.to_string_lossy(), needle_lower))
         })
+        .unwrap_or(false)
+}
+
+fn process_name_matches_exact(name: &str, needle_lower: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(needle_lower)
+}
+
+fn is_kiro_terminal_wrapper(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim() == "kiro-cli-term")
         .unwrap_or(false)
 }
 
@@ -930,6 +968,13 @@ mod tests {
     #[test]
     fn agent_target_is_explicitly_named() {
         assert_eq!(agent_target("ab-12345678"), "ab-12345678:agent");
+    }
+
+    #[test]
+    fn terminal_wrapper_is_not_an_agent_identity() {
+        assert!(!process_name_matches_exact("kiro-cli-term\n", "kiro-cli"));
+        assert!(process_name_matches_exact("codex\n", "codex"));
+        assert!(process_name_matches_exact("kiro-cli\n", "kiro-cli"));
     }
 
     #[test]
