@@ -44,11 +44,11 @@ ab board
 
 Press `n` to create a task and `Enter` to start it. Agentboard creates the
 worktree, starts the agent, and shows its live progress. Tasks move through
-Backlog, Running, Blocked, and Done; select a task and press `Enter` to start,
+Backlog, Running, Blocked, Review, and Done; select a task and press `Enter` to start,
 attach, or resume it as appropriate. There is also a hidden **Keep** lane for
 unfinished work that is neither blocked nor done — a sketch of an idea worth
 revisiting later. Press `k` to send the selected task to Keep, and `v` to
-show or hide the lane. When entering a session you start in the
+configure which lanes are visible and their order. When entering a session you start in the
 agent window. Each task also has a shell window rooted in the same worktree:
 switch with `Ctrl+b s` (or `Ctrl+b 1`/`p`) and return to the agent with
 `Ctrl+b a` (or `Ctrl+b 0`/`n`). You can scroll with `Ctrl+b [` and leave the
@@ -67,9 +67,11 @@ Essential controls:
 |-----|--------|
 | `n` | Create a task |
 | `Enter` | Start, attach to, or resume the selected task |
+| `D` | Advance Blocked → Review → Done |
 | `p` | Send a quick prompt |
 | `k` | Send the selected task to the Keep lane |
-| `v` | Show or hide the Keep lane |
+| `v` / `L` | Configure visible lanes and their order |
+| `V` | Reveal all configured lanes for the current session |
 | `?` | Show board help |
 | `q` / `Esc` | Quit the board or exit scroll mode in the session |
 | `Ctrl+b`, then `d` | Detach from an agent session and return to the board |
