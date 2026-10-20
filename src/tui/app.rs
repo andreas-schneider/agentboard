@@ -422,7 +422,7 @@ impl App {
         let resumable: Vec<Task> = self
             .tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Blocked || t.status == TaskStatus::Done)
+            .filter(|t| t.status != TaskStatus::Running)
             .cloned()
             .collect();
 

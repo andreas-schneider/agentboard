@@ -93,8 +93,17 @@ the list with the arrow keys, toggle visibility with Space, use Shift+arrow to
 reorder, and press Enter to save.
 The header reports tasks in hidden lanes, and `V` reveals all lanes for the
 current board session. `D` advances a Blocked task to Review and a Review task
-to Done. This setting changes presentation only; it never moves or deletes
-tasks.
+to Done. If Review is hidden, `D` moves Blocked tasks directly to Done.
+Changing visibility itself never moves or deletes tasks.
+
+Lane activity follows actual agent work across every lane: observed work moves
+a task to Running, and observed completion or exit moves it to Blocked.
+Attaching to or reopening a session preserves the current lane until work is
+observed. An idle interactive agent process alone does not mean it is working.
+Detection runs while the board is open, every two seconds and after detaching
+from a session. While attached, lane updates wait until returning to the board.
+Detection uses the supported agent's visible activity indicators and process
+tree; unknown CLI output or very short turns between polls may be missed.
 
 Agentboard currently supports `kiro-cli`, `codex`, and GitHub Copilot CLI
 (`copilot`). Some terminal interaction

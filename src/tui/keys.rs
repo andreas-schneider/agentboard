@@ -140,25 +140,10 @@ pub fn handle_normal_key(
                             terminal.clear().context("failed to clear terminal")?;
                             app.refresh_now()?;
                         } else {
-                            if task.status == TaskStatus::Review {
-                                app.notify(Notification::info(
-                                    "No active session — press R to resume work",
-                                ));
-                                return Ok(());
-                            }
                             // No live session — resume the configured harness and attach.
-                            // Works for Running (orphaned), Blocked, and Done tasks.
+                            // Preserve the lane until activity detection observes work.
                             let task_clone = task.clone();
-                            // Starting the agent on a Done task means it's working
-                            // again, so move it into Running — it will show up in the
-                            // Running column and completion detection will move it to
-                            // Blocked when the agent finishes. Running/Blocked keep
-                            let desired_status = match task.status {
-                                TaskStatus::Done | TaskStatus::Keep => TaskStatus::Running,
-                                ref other => other.clone(),
-                            };
-                            match orchestrator::resume_task(&app.store, &task_clone, desired_status)
-                            {
+                            match orchestrator::resume_task(&app.store, &task_clone) {
                                 Ok(updated) => {
                                     // Grace period prevents completion detection from
                                     // firing before the agent has launched.
