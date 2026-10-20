@@ -12,7 +12,7 @@ gone, and restores them:
 3. **Re-launches the configured agent** with its resume behavior so it can pick up where it left off
 
 You'll see a notification like "🔄 Restored 3 interrupted tasks" and all tasks
-resume as Running.
+are initially Blocked until the agent is observed working again.
 
 Session output is continuously logged via tmux `pipe-pane` to
 `<worktree>/.agentboard/session.log`. If no log is available (e.g., tasks
