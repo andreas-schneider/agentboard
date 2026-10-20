@@ -7,10 +7,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::store::TaskStatus;
+
 const TEMPLATE: &str = r#"# Agentboard configuration
 # This file is user-owned and is never read from a repository.
 agent = "kiro-cli"
 profile = "interactive"
+
+# Board lanes are listed in the order they should appear. Omit a lane to hide
+# it; hidden tasks remain stored and can be restored with the board's `V` key.
+# [board]
+# lanes = ["Backlog", "Running", "Blocked", "Review", "Done"]
 
 [agents.kiro-cli]
 program = "kiro-cli"
@@ -60,6 +67,14 @@ pub struct FileConfig {
     pub agents: HashMap<String, AgentOptions>,
     #[serde(default)]
     pub profiles: HashMap<String, HashMap<String, AgentOptions>>,
+    #[serde(default)]
+    pub board: BoardConfig,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct BoardConfig {
+    /// Ordered visible lanes. When omitted, the board uses its built-in default.
+    pub lanes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -265,6 +280,105 @@ pub fn init() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Resolve the ordered visible lanes for the board.
+///
+/// Only built-in statuses are accepted for now. This provides a visibility
+/// and ordering seam without pretending that custom workflow stages exist.
+pub fn board_lanes(config: &FileConfig) -> Result<Vec<TaskStatus>> {
+    let Some(names) = &config.board.lanes else {
+        return Ok(default_board_lanes());
+    };
+
+    if names.is_empty() {
+        anyhow::bail!("[board].lanes must contain at least one lane");
+    }
+
+    let mut lanes = Vec::with_capacity(names.len());
+    for name in names {
+        let lane = name.parse::<TaskStatus>().with_context(|| {
+            format!(
+                "invalid board lane '{name}'; expected one of {}",
+                TaskStatus::all_columns().join(", ")
+            )
+        })?;
+        if lanes.contains(&lane) {
+            anyhow::bail!("[board].lanes contains duplicate lane '{name}'");
+        }
+        lanes.push(lane);
+    }
+    Ok(lanes)
+}
+
+/// Persist the board's visible lane order while preserving the rest of the
+/// user's configuration. The board editor is the primary interface; the TOML
+/// representation is kept as a portable advanced setting.
+pub fn save_board_lanes(lanes: &[TaskStatus]) -> Result<PathBuf> {
+    if lanes.is_empty() {
+        anyhow::bail!("at least one board lane must remain visible");
+    }
+
+    let path = path().context("cannot determine the user configuration directory")?;
+    let text = if path.exists() {
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        TEMPLATE.to_owned()
+    };
+    let names = lanes
+        .iter()
+        .map(|lane| format!("\"{lane}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let board_block = format!("[board]\nlanes = [{names}]\n");
+    let updated = replace_board_section(&text, &board_block);
+
+    fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+    fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+fn replace_board_section(text: &str, replacement: &str) -> String {
+    let mut output = String::new();
+    let mut in_board = false;
+    let mut replaced = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[board]" {
+            if !replaced {
+                output.push_str(replacement);
+                replaced = true;
+            }
+            in_board = true;
+            continue;
+        }
+        if in_board && trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_board = false;
+        }
+        if !in_board {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    if !replaced {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(replacement);
+    }
+    output
+}
+
+pub fn default_board_lanes() -> Vec<TaskStatus> {
+    vec![
+        TaskStatus::Backlog,
+        TaskStatus::Running,
+        TaskStatus::Blocked,
+        TaskStatus::Review,
+        TaskStatus::Done,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +437,62 @@ mod tests {
         assert_eq!(config.profile.as_deref(), Some("interactive"));
         assert!(config.profiles.contains_key("interactive"));
         assert!(config.profiles.contains_key("unattended"));
+    }
+
+    #[test]
+    fn board_lanes_default_to_current_board() {
+        let config = FileConfig::default();
+        assert_eq!(board_lanes(&config).unwrap(), default_board_lanes());
+    }
+
+    #[test]
+    fn board_lanes_preserve_configured_order_and_visibility() {
+        let config: FileConfig = toml::from_str(
+            r#"
+            [board]
+            lanes = ["Running", "Blocked", "Backlog"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            board_lanes(&config).unwrap(),
+            vec![
+                TaskStatus::Running,
+                TaskStatus::Blocked,
+                TaskStatus::Backlog
+            ]
+        );
+    }
+
+    #[test]
+    fn board_lanes_reject_unknown_and_duplicate_lanes() {
+        let unknown: FileConfig = toml::from_str(
+            r#"
+            [board]
+            lanes = ["NotALane"]
+            "#,
+        )
+        .unwrap();
+        assert!(board_lanes(&unknown).is_err());
+
+        let duplicate: FileConfig = toml::from_str(
+            r#"
+            [board]
+            lanes = ["Backlog", "Backlog"]
+            "#,
+        )
+        .unwrap();
+        assert!(board_lanes(&duplicate).is_err());
+    }
+
+    #[test]
+    fn replace_board_section_preserves_other_configuration() {
+        let input = "agent = \"codex\"\n\n[board]\nlanes = [\"Done\"]\n\n[agents.codex]\nprogram = \"codex\"\n";
+        let output = replace_board_section(input, "[board]\nlanes = [\"Backlog\"]\n");
+        assert!(output.contains("agent = \"codex\""));
+        assert!(output.contains("[agents.codex]"));
+        assert!(output.contains("lanes = [\"Backlog\"]"));
+        assert!(!output.contains("lanes = [\"Done\"]"));
     }
 
     #[test]

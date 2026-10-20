@@ -23,6 +23,11 @@ existing file.
 agent = "kiro-cli"
 profile = "interactive"
 
+# Board lanes are shown in this order. Omit a lane to hide it.
+# Hidden tasks remain stored; use `v` in the board to configure lanes.
+# [board]
+# lanes = ["Backlog", "Running", "Blocked", "Review", "Done"]
+
 [agents.kiro-cli]
 program = "kiro-cli"
 
@@ -68,6 +73,28 @@ the executable and optional model. Each `[profiles.<profile>.<agent>]` entry
 defines the complete arguments for starting and resuming that agent. The task
 prompt is appended automatically; arguments are passed as individual values,
 not as a shell command.
+
+### Board lanes
+
+The optional `[board]` section controls which built-in lanes are visible and
+their order. Supported lanes are `Backlog`, `Running`, `Blocked`, `Review`,
+`Done`, and `Keep`. If omitted, the board shows Backlog, Running, Blocked,
+Review, and Done, with Keep hidden as before.
+
+For example, to focus on active work and hide Done:
+
+```toml
+[board]
+lanes = ["Backlog", "Running", "Blocked"]
+```
+
+The board's `v` overlay is the recommended way to configure lanes: move through
+the list with the arrow keys, toggle visibility with Space, use Shift+arrow to
+reorder, and press Enter to save.
+The header reports tasks in hidden lanes, and `V` reveals all lanes for the
+current board session. `D` advances a Blocked task to Review and a Review task
+to Done. This setting changes presentation only; it never moves or deletes
+tasks.
 
 Agentboard currently supports `kiro-cli`, `codex`, and GitHub Copilot CLI
 (`copilot`). Some terminal interaction

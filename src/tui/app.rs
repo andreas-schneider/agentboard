@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::config;
 use crate::orchestrator;
 use crate::store::{Task, TaskStatus, TaskStore};
 use crate::tmux;
@@ -54,6 +55,11 @@ pub enum InputMode {
     },
     /// Quick prompt palette — press a number to send a pre-defined prompt.
     QuickPrompts,
+    /// Configure visible board lanes and their order.
+    ConfigureLanes {
+        lanes: Vec<LaneSetting>,
+        selected: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -63,6 +69,12 @@ pub struct InputField {
     pub placeholder: &'static str,
     /// Cursor position in the value string (byte offset, always on a char boundary).
     pub cursor_pos: usize,
+}
+
+#[derive(Clone)]
+pub struct LaneSetting {
+    pub status: TaskStatus,
+    pub visible: bool,
 }
 
 #[derive(Clone)]
@@ -178,16 +190,13 @@ impl App {
     pub fn new(store: TaskStore, repo_filter: Option<String>) -> Result<Self> {
         let tasks = store.list_tasks()?;
         let now = Instant::now();
+        let columns = config::board_lanes(&config::load()?)?;
+        let show_keep = columns.contains(&TaskStatus::Keep);
         Ok(Self {
             tasks,
             selected_column: 0,
             selected_row: 0,
-            columns: vec![
-                TaskStatus::Backlog,
-                TaskStatus::Running,
-                TaskStatus::Blocked,
-                TaskStatus::Done,
-            ],
+            columns,
             should_quit: false,
             store,
             detail_lines: String::new(),
@@ -200,7 +209,7 @@ impl App {
             notification: None,
             input_mode: InputMode::Normal,
             show_help: false,
-            show_keep: false,
+            show_keep,
             repo_filter,
         })
     }
@@ -217,7 +226,7 @@ impl App {
             .collect();
 
         // Each lane has an order that matches its purpose. `updated_at` is
-        // changed when a task enters Running, Blocked, or Done, so it also
+        // changed when a task enters Running, Blocked, Review, or Done, so it also
         // records when the task most recently became relevant in that lane.
         match status {
             // Keep long-waiting work visible instead of continually pushing it
@@ -230,7 +239,11 @@ impl App {
             // Surface the task with the most recent activity, problem, or
             // completion first. Keep is a parked lane that sorts like Done so
             // the most recently kept idea stays at the top.
-            TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done | TaskStatus::Keep => {
+            TaskStatus::Running
+            | TaskStatus::Blocked
+            | TaskStatus::Review
+            | TaskStatus::Done
+            | TaskStatus::Keep => {
                 tasks.sort_by(|a, b| {
                     b.updated_at
                         .cmp(&a.updated_at)
@@ -495,6 +508,7 @@ impl App {
         let task = match self.selected_task() {
             Some(t)
                 if t.status == TaskStatus::Blocked
+                    || t.status == TaskStatus::Review
                     || t.status == TaskStatus::Done
                     || t.status == TaskStatus::Keep =>
             {
@@ -502,7 +516,7 @@ impl App {
             }
             Some(t) => {
                 self.notify(Notification::warn(format!(
-                    "Can only restart Blocked/Done/Keep tasks (this is {})",
+                    "Can only restart Blocked/Review/Done/Keep tasks (this is {})",
                     t.status
                 )));
                 return Ok(());
@@ -534,17 +548,37 @@ impl App {
         Ok(())
     }
 
-    pub fn mark_done(&mut self) -> Result<()> {
+    /// Advance a task through the human review workflow.
+    pub fn advance_task(&mut self) -> Result<()> {
         let task = match self.selected_task() {
             Some(t) => t.clone(),
             None => return Ok(()),
         };
-        let updated = orchestrator::done_task(&self.store, &task)?;
+        let skipped_review =
+            task.status == TaskStatus::Blocked && !self.columns.contains(&TaskStatus::Review);
+        let next_status = match task.status {
+            TaskStatus::Blocked if skipped_review => TaskStatus::Done,
+            TaskStatus::Blocked => TaskStatus::Review,
+            TaskStatus::Review | TaskStatus::Running => TaskStatus::Done,
+            ref status => {
+                self.notify(Notification::warn(format!(
+                    "Can only advance Blocked, Review, or Running tasks (this is {})",
+                    status
+                )));
+                return Ok(());
+            }
+        };
+        let updated = orchestrator::set_task_status(&self.store, &task, next_status.clone())?;
         self.refresh_now()?;
-        self.notify(Notification::info(format!(
-            "Task {} marked done",
-            &updated.id[..8]
-        )));
+        let message = if skipped_review {
+            format!(
+                "Task {} moved directly to Done (Review hidden)",
+                &updated.id[..8]
+            )
+        } else {
+            format!("Task {} moved to {}", &updated.id[..8], next_status)
+        };
+        self.notify(Notification::info(message));
         Ok(())
     }
 
@@ -575,23 +609,47 @@ impl App {
         Ok(())
     }
 
-    /// Show or hide the "Keep" lane. When hidden, the selected column is
-    /// clamped back into the visible range so navigation stays valid.
-    pub fn toggle_keep_lane(&mut self) {
-        self.show_keep = !self.show_keep;
-        if self.show_keep {
-            if !self.columns.contains(&TaskStatus::Keep) {
-                self.columns.push(TaskStatus::Keep);
-            }
-        } else {
-            self.columns.retain(|c| *c != TaskStatus::Keep);
-            if self.selected_column >= self.columns.len() {
-                self.selected_column = self.columns.len().saturating_sub(1);
-            }
-            self.selected_row = 0;
-        }
+    /// Reveal every built-in lane for this board session. This is a recovery
+    /// path for tasks in lanes hidden by the user's board configuration.
+    pub fn show_all_lanes(&mut self) {
+        self.columns = TaskStatus::all().to_vec();
+        self.show_keep = true;
+        self.selected_column = self.selected_column.min(self.columns.len() - 1);
+        self.selected_row = 0;
         self.clamp_row();
         self.capture_detail();
+    }
+
+    pub fn open_lane_config(&mut self) {
+        let lanes = TaskStatus::all()
+            .iter()
+            .map(|status| LaneSetting {
+                status: status.clone(),
+                visible: self.columns.contains(status),
+            })
+            .collect();
+        self.input_mode = InputMode::ConfigureLanes { lanes, selected: 0 };
+    }
+
+    pub fn save_lane_config(&mut self, settings: &[LaneSetting]) -> Result<()> {
+        let visible: Vec<TaskStatus> = settings
+            .iter()
+            .filter(|setting| setting.visible)
+            .map(|setting| setting.status.clone())
+            .collect();
+        config::save_board_lanes(&visible)?;
+
+        self.columns = visible;
+        self.show_keep = self.columns.contains(&TaskStatus::Keep);
+        self.selected_column = self
+            .selected_column
+            .min(self.columns.len().saturating_sub(1));
+        self.selected_row = 0;
+        self.clamp_row();
+        self.capture_detail();
+        self.input_mode = InputMode::Normal;
+        self.notify(Notification::info("Board lanes saved"));
+        Ok(())
     }
 
     pub fn delete_task(&mut self, id: &str) -> Result<()> {
@@ -755,6 +813,7 @@ impl App {
             None => vec![
                 ("n", "new task"),
                 ("f", "filter"),
+                ("v", "lanes"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
@@ -779,7 +838,19 @@ impl App {
                         actions.push(("Enter", "attach"));
                         actions.push(("m", "send msg"));
                         actions.push(("p", "prompts"));
-                        actions.push(("D", "done"));
+                        let description = if self.columns.contains(&TaskStatus::Review) {
+                            "send to review"
+                        } else {
+                            "done (review hidden)"
+                        };
+                        actions.push(("D", description));
+                        actions.push(("R", "restart"));
+                        actions.push(("k", "keep"));
+                        actions.push(("x", "delete"));
+                    }
+                    TaskStatus::Review => {
+                        actions.push(("Enter", "attach"));
+                        actions.push(("D", "approve / done"));
                         actions.push(("R", "restart"));
                         actions.push(("k", "keep"));
                         actions.push(("x", "delete"));
@@ -796,6 +867,7 @@ impl App {
                         actions.push(("x", "delete"));
                     }
                 }
+                actions.push(("v", "lanes"));
                 actions.push(("n", "new"));
                 actions.push(("f", "filter"));
                 actions.push(("?", "help"));
@@ -938,28 +1010,87 @@ mod tests {
     }
 
     #[test]
-    fn keep_lane_toggles_visibility_and_clamps_selection() {
+    fn lane_config_lists_all_lanes_and_current_visibility() {
         let mut app = App::new(TaskStore::open_in_memory().unwrap(), None).unwrap();
 
-        // Keep lane starts hidden and is not among the visible columns.
-        assert!(!app.show_keep);
-        assert!(!app.columns.contains(&TaskStatus::Keep));
-        let base_columns = app.columns.len();
+        app.open_lane_config();
+        let InputMode::ConfigureLanes { lanes, selected } = &app.input_mode else {
+            panic!("expected lane configuration mode");
+        };
 
-        // Select the last visible column, then reveal Keep.
-        app.selected_column = base_columns - 1;
-        app.toggle_keep_lane();
+        assert_eq!(*selected, 0);
+        assert_eq!(lanes.len(), TaskStatus::all().len());
+        assert_eq!(
+            lanes
+                .iter()
+                .find(|lane| lane.status == TaskStatus::Done)
+                .unwrap()
+                .visible,
+            app.columns.contains(&TaskStatus::Done)
+        );
+        assert_eq!(
+            lanes
+                .iter()
+                .find(|lane| lane.status == TaskStatus::Keep)
+                .unwrap()
+                .visible,
+            app.show_keep
+        );
+
+        let names: Vec<String> = lanes.iter().map(|lane| lane.status.to_string()).collect();
+        assert_eq!(
+            names,
+            ["Backlog", "Running", "Blocked", "Review", "Done", "Keep"]
+        );
+    }
+
+    #[test]
+    fn show_all_lanes_reveals_hidden_lanes_and_clamps_selection() {
+        let mut app = App::new(TaskStore::open_in_memory().unwrap(), None).unwrap();
+
+        app.selected_column = app.columns.len() - 1;
+        app.show_all_lanes();
         assert!(app.show_keep);
         assert_eq!(app.columns.last(), Some(&TaskStatus::Keep));
-        assert_eq!(app.columns.len(), base_columns + 1);
-
-        // Move onto the Keep column, then hide it — selection must clamp back
-        // into the remaining visible columns.
-        app.selected_column = app.columns.len() - 1;
-        app.toggle_keep_lane();
-        assert!(!app.show_keep);
-        assert!(!app.columns.contains(&TaskStatus::Keep));
         assert!(app.selected_column < app.columns.len());
+    }
+
+    #[test]
+    fn blocked_task_advances_to_review_when_review_is_visible() {
+        let store = TaskStore::open_in_memory().unwrap();
+        let task = store.create_task("Needs review", "", "/tmp/repo").unwrap();
+        store.update_status(&task.id, TaskStatus::Blocked).unwrap();
+        let mut app = App::new(store, None).unwrap();
+        app.columns = vec![TaskStatus::Blocked, TaskStatus::Review, TaskStatus::Done];
+        app.selected_column = 0;
+
+        app.advance_task().unwrap();
+
+        assert_eq!(
+            app.store.get_task(&task.id).unwrap().status,
+            TaskStatus::Review
+        );
+    }
+
+    #[test]
+    fn blocked_task_skips_hidden_review_lane() {
+        let store = TaskStore::open_in_memory().unwrap();
+        let task = store.create_task("Skip review", "", "/tmp/repo").unwrap();
+        store.update_status(&task.id, TaskStatus::Blocked).unwrap();
+        let mut app = App::new(store, None).unwrap();
+        app.columns = vec![TaskStatus::Blocked, TaskStatus::Done];
+        app.selected_column = 0;
+
+        assert!(app
+            .available_actions()
+            .iter()
+            .any(|(key, description)| *key == "D" && *description == "done (review hidden)"));
+        app.advance_task().unwrap();
+
+        assert_eq!(
+            app.store.get_task(&task.id).unwrap().status,
+            TaskStatus::Done
+        );
     }
 
     #[test]

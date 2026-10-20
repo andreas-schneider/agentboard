@@ -54,6 +54,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
         InputMode::SendMessage { .. } => render_send_message(frame, app, size),
         InputMode::Confirm { .. } => render_confirm_dialog(frame, app, size),
         InputMode::QuickPrompts => render_quick_prompts(frame, app, size),
+        InputMode::ConfigureLanes { .. } => render_lane_config(frame, app, size),
         InputMode::Normal => {}
     }
 }
@@ -66,6 +67,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let backlog_count = app.tasks_in_column(&TaskStatus::Backlog).len();
     let running_count = app.tasks_in_column(&TaskStatus::Running).len();
     let blocked_count = app.tasks_in_column(&TaskStatus::Blocked).len();
+    let review_count = app.tasks_in_column(&TaskStatus::Review).len();
     let done_count = app.tasks_in_column(&TaskStatus::Done).len();
     let keep_count = app.tasks_in_column(&TaskStatus::Keep).len();
 
@@ -124,6 +126,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw("")
         },
         Span::styled(
+            format!("◈ {} review", review_count),
+            Style::default().fg(Color::Blue),
+        ),
+        Span::raw("  "),
+        Span::styled(
             format!("✓ {} done", done_count),
             Style::default().fg(Color::Cyan),
         ),
@@ -134,6 +141,19 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             format!("◇ {} keep", keep_count),
             Style::default().fg(Color::Magenta),
+        ));
+    }
+
+    let hidden_count = TaskStatus::all()
+        .iter()
+        .filter(|status| !app.columns.contains(status))
+        .map(|status| app.tasks_in_column(status).len())
+        .sum::<usize>();
+    if hidden_count > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("… {} hidden (V)", hidden_count),
+            Style::default().fg(Color::DarkGray),
         ));
     }
 
@@ -522,7 +542,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         )]),
         Line::from(vec![
             Span::styled("  Enter       ", Style::default().fg(Color::Cyan)),
-            Span::raw("Start (backlog) / Attach (running/blocked/done)"),
+            Span::raw("Start (backlog) / Attach (running/blocked/review/done)"),
         ]),
         Line::from(vec![
             Span::styled("  s           ", Style::default().fg(Color::Cyan)),
@@ -546,7 +566,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  D           ", Style::default().fg(Color::Cyan)),
-            Span::raw("Mark task as done"),
+            Span::raw("Advance Blocked → Review → Done"),
         ]),
         Line::from(vec![
             Span::styled("  k           ", Style::default().fg(Color::Cyan)),
@@ -554,11 +574,15 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  v           ", Style::default().fg(Color::Cyan)),
-            Span::raw("Show / hide the Keep lane"),
+            Span::raw("Configure visible lanes and order"),
+        ]),
+        Line::from(vec![
+            Span::styled("  V           ", Style::default().fg(Color::Cyan)),
+            Span::raw("Show all lanes for this session"),
         ]),
         Line::from(vec![
             Span::styled("  R           ", Style::default().fg(Color::Cyan)),
-            Span::raw("Restart blocked/done task"),
+            Span::raw("Restart blocked/review/done task"),
         ]),
         Line::from(vec![
             Span::styled("  x           ", Style::default().fg(Color::Cyan)),
@@ -1104,6 +1128,59 @@ fn render_quick_prompts(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Lane configuration overlay
+// ---------------------------------------------------------------------------
+
+fn render_lane_config(frame: &mut Frame, app: &App, area: Rect) {
+    let overlay = centered_rect(62, 58, area);
+    frame.render_widget(Clear, overlay);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Configure board lanes ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    let InputMode::ConfigureLanes { lanes, selected } = &app.input_mode else {
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Space toggle · ↑↓ select · Shift+↑↓ reorder · a show all · Enter save · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+    for (index, lane) in lanes.iter().enumerate() {
+        let marker = if lane.visible { "x" } else { " " };
+        let count = app.tasks_in_column(&lane.status).len();
+        let line_style = if index == *selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(color_for_status(&lane.status))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", marker), line_style),
+            Span::styled(format!(" {:<8} ", lane.status), line_style),
+            Span::styled(format!("{} tasks", count), line_style),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).style(Style::default().fg(Color::White));
+    frame.render_widget(paragraph, inner);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1112,6 +1189,7 @@ pub fn color_for_status(status: &TaskStatus) -> Color {
         TaskStatus::Backlog => Color::Gray,
         TaskStatus::Running => Color::Green,
         TaskStatus::Blocked => Color::Yellow,
+        TaskStatus::Review => Color::Blue,
         TaskStatus::Done => Color::Cyan,
         TaskStatus::Keep => Color::Magenta,
     }

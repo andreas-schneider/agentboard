@@ -443,7 +443,7 @@ Use the non-interactive `ab` CLI to inspect and operate on the board. Do not run
 * `ab kill <id>` — stop a running task and mark it Blocked.\n\
 * `ab done <id>` — mark a task Done.\n\
 * `ab config show` / `ab config check` — inspect or validate configuration.\n\n\
-Task IDs accept unique prefixes. Statuses are Backlog, Running, Blocked, and Done.\n\n\
+Task IDs accept unique prefixes. Statuses are Backlog, Running, Blocked, Review, and Done. Agent completion moves tasks to Blocked; review them before moving them to Done.\n\n\
 ## Operating rules\n\n\
 Inspect a task with `ab show` before changing it. Preserve working-directory paths when creating or editing tasks. Do not delete tasks, kill sessions, modify Agentboard configuration, or bulk-change tasks unless the user explicitly asks. Do not mark a task Done merely because it was inspected; mark it Done only when its requested work is complete.\n\n\
 The current agent session is already owned by this task. It runs in tmux with an `agent` window and a `shell` window. You can inspect the session with `tmux display-message -p '#S'`, `tmux list-windows`, or `tmux capture-pane -p -S -100`. Do not kill or detach the current session unless explicitly asked.\n\n\
@@ -835,14 +835,20 @@ pub fn delete_task(store: &TaskStore, task: &Task) -> Result<()> {
     Ok(())
 }
 
-/// Mark a task as done: update status, keep session and worktree alive for inspection.
-pub fn done_task(store: &TaskStore, task: &Task) -> Result<Task> {
+/// Update a task's human-controlled status while preserving its session and
+/// worktree for inspection.
+pub fn set_task_status(store: &TaskStore, task: &Task, status: TaskStatus) -> Result<Task> {
     let harness = harness_for_task(store, task);
     let mut updated = task.clone();
-    updated.status = TaskStatus::Done;
+    updated.status = status;
     updated.agent_cli = Some(harness.name().to_owned());
     store.update_task(&updated)?;
     Ok(updated)
+}
+
+/// Mark a task as done: update status, keep session and worktree alive for inspection.
+pub fn done_task(store: &TaskStore, task: &Task) -> Result<Task> {
+    set_task_status(store, task, TaskStatus::Done)
 }
 
 // ---------------------------------------------------------------------------

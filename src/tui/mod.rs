@@ -167,6 +167,9 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                     InputMode::QuickPrompts => {
                         keys::handle_quick_prompt_key(app, key.code)?;
                     }
+                    InputMode::ConfigureLanes { .. } => {
+                        keys::handle_lane_config_key(app, key)?;
+                    }
                 },
                 _ => {}
             }

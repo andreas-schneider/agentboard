@@ -71,14 +71,15 @@ pub fn handle_normal_key(
             app.keep_task()?;
         }
 
-        // Show or hide the "Keep" lane.
-        KeyCode::Char('v') => {
-            app.toggle_keep_lane();
-            app.notify(Notification::info(if app.show_keep {
-                "Keep lane shown"
-            } else {
-                "Keep lane hidden"
-            }));
+        // Configure which lanes are visible and their order.
+        KeyCode::Char('v') | KeyCode::Char('L') => {
+            app.open_lane_config();
+        }
+
+        // Reveal every lane hidden by configuration for this session.
+        KeyCode::Char('V') => {
+            app.show_all_lanes();
+            app.notify(Notification::info("All lanes shown for this session"));
         }
 
         // Tab cycles columns forward, Shift+Tab backward (BackTab)
@@ -117,6 +118,7 @@ pub fn handle_normal_key(
                 match task.status {
                     TaskStatus::Running
                     | TaskStatus::Blocked
+                    | TaskStatus::Review
                     | TaskStatus::Done
                     | TaskStatus::Keep => {
                         let session_alive = task
@@ -141,7 +143,7 @@ pub fn handle_normal_key(
                             app.refresh_now()?;
                         } else {
                             // No live session — resume the configured harness and attach.
-                            // Works for Running (orphaned), Blocked, and Done tasks.
+                            // Works for Running (orphaned), Blocked, Review, and Done tasks.
                             let task_clone = task.clone();
                             // Starting the agent on a Done task means it's working
                             // again, so move it into Running — it will show up in the
@@ -299,7 +301,7 @@ pub fn handle_normal_key(
 
         // Mark done
         KeyCode::Char('D') => {
-            app.mark_done()?;
+            app.advance_task()?;
         }
 
         // Edit task (title for any lane; full form for Backlog)
@@ -791,6 +793,61 @@ pub fn handle_quick_prompt_key(app: &mut App, code: KeyCode) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Lane configuration overlay
+// ---------------------------------------------------------------------------
+
+pub fn handle_lane_config_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    if matches!(key.code, KeyCode::Esc) {
+        app.input_mode = InputMode::Normal;
+        return Ok(());
+    }
+    if matches!(key.code, KeyCode::Enter) {
+        let settings = match &app.input_mode {
+            InputMode::ConfigureLanes { lanes, .. } => lanes.clone(),
+            _ => return Ok(()),
+        };
+        return app.save_lane_config(&settings);
+    }
+
+    if let InputMode::ConfigureLanes { lanes, selected } = &mut app.input_mode {
+        let reorder = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Up => {
+                if *selected > 0 {
+                    if reorder {
+                        lanes.swap(*selected, *selected - 1);
+                    }
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if *selected + 1 < lanes.len() {
+                    if reorder {
+                        lanes.swap(*selected, *selected + 1);
+                    }
+                    *selected += 1;
+                }
+            }
+            KeyCode::Char(' ') => {
+                if lanes[*selected].visible && lanes.iter().filter(|lane| lane.visible).count() == 1
+                {
+                    app.notify(Notification::warn("At least one lane must remain visible"));
+                } else {
+                    lanes[*selected].visible = !lanes[*selected].visible;
+                }
+            }
+            KeyCode::Char('a') => {
+                for lane in lanes.iter_mut() {
+                    lane.visible = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Shared field editing helpers
 // ---------------------------------------------------------------------------
 
@@ -872,8 +929,8 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_field_paste, handle_new_task_key};
-    use crate::store::TaskStore;
+    use super::{handle_field_paste, handle_lane_config_key, handle_new_task_key};
+    use crate::store::{TaskStatus, TaskStore};
     use crate::tui::app::{App, InputField, InputMode};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -933,5 +990,36 @@ mod tests {
 
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert!(app.tasks.is_empty());
+    }
+
+    #[test]
+    fn lane_arrows_navigate_without_reordering() {
+        let mut app = App::new(TaskStore::open_in_memory().unwrap(), None).unwrap();
+        app.open_lane_config();
+
+        handle_lane_config_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+
+        let InputMode::ConfigureLanes { lanes, selected } = &app.input_mode else {
+            panic!("expected lane configuration mode");
+        };
+        assert_eq!(*selected, 1);
+        assert_eq!(lanes[0].status, TaskStatus::Backlog);
+        assert_eq!(lanes[1].status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn shifted_lane_arrows_reorder_and_follow_lane() {
+        let mut app = App::new(TaskStore::open_in_memory().unwrap(), None).unwrap();
+        app.open_lane_config();
+
+        handle_lane_config_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+            .unwrap();
+
+        let InputMode::ConfigureLanes { lanes, selected } = &app.input_mode else {
+            panic!("expected lane configuration mode");
+        };
+        assert_eq!(*selected, 1);
+        assert_eq!(lanes[0].status, TaskStatus::Running);
+        assert_eq!(lanes[1].status, TaskStatus::Backlog);
     }
 }

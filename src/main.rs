@@ -31,6 +31,7 @@ fn main() -> Result<()> {
             }
             cli::ConfigCommands::Show => {
                 let cfg = config::load()?;
+                let board_lanes = config::board_lanes(&cfg)?;
                 let effective = config::effective(&cfg, None)?;
                 println!(
                     "Config: {}",
@@ -46,6 +47,7 @@ fn main() -> Result<()> {
                     effective.args,
                     effective.resume_args
                 );
+                println!("Board lanes: {:?}", board_lanes);
                 if effective.profile == "unattended" {
                     println!(
                         "WARNING: unattended mode disables normal agent approvals or sandboxing."
@@ -54,6 +56,7 @@ fn main() -> Result<()> {
             }
             cli::ConfigCommands::Check => {
                 let cfg = config::load()?;
+                config::board_lanes(&cfg)?;
                 let effective = config::effective(&cfg, None)?;
                 println!(
                     "Configuration is valid ({} / {}).",
