@@ -15,14 +15,14 @@
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Start (backlog) / Attach or auto-resume (running/blocked/review/done/keep) |
+| `Enter` | Start (backlog) / Attach or auto-resume (running/blocked/done/keep); inspect Review |
 | `s` | Start selected backlog task |
 | `e` | Edit backlog task (title, description, working directory) |
 | `m` | Send a message to an agent (running/blocked) |
 | `p` | Open the quick prompts palette |
 | `K` | Kill a running task (with confirmation) |
 | `D` | Advance: Blocked → Review → Done (or Running → Done) |
-| `R` | Restart a blocked/done/keep task |
+| `R` | Restart a blocked/review/done/keep task and move it to Running |
 | `k` | Send the selected task to the Keep lane |
 | `v` / `L` | Configure visible lanes and their order |
 | `V` | Reveal all lanes hidden by configuration for this session |
