@@ -29,6 +29,12 @@ fn harness_for_task(store: &TaskStore, task: &Task) -> Box<dyn agent::AgentHarne
         .unwrap_or_else(agent::default_harness)
 }
 
+/// A live interactive process can be idle. Require current work indicators
+/// as well as a live agent so restored scrollback cannot restart a task.
+fn agent_is_working(harness: &dyn agent::AgentHarness, visible: &str, present: bool) -> bool {
+    present && harness.is_active(visible)
+}
+
 // ---------------------------------------------------------------------------
 // Completion detection
 // ---------------------------------------------------------------------------
@@ -98,26 +104,15 @@ impl CompletionEvent {
 /// For each detected completion, the task is moved to `Blocked` in the store
 /// and a [`CompletionEvent`] is returned.
 ///
-/// `grace_task_ids` is the set of task IDs that were recently started/restarted
-/// and should skip Tier 2–4 detection (the agent CLI hasn't had time to
-/// launch yet, so idle-prompt and process checks would false-positive).
-/// Tier 1 (session dead) is always checked regardless of grace period.
+/// Launching a CLI no longer marks a task Running; only observed work does.
+/// Completion therefore needs no launch grace period.
 pub fn check_completions(
     store: &TaskStore,
     running_tasks: &[Task],
     session_alive: &std::collections::HashMap<String, bool>,
-    grace_task_ids: &std::collections::HashSet<String>,
+    _grace_task_ids: &std::collections::HashSet<String>,
 ) -> Vec<CompletionEvent> {
     let mut events = Vec::new();
-
-    // DB-level grace period — a secondary safety net independent of
-    // tui::app::TASK_START_GRACE_PERIOD (which tracks in-memory Instants).
-    // This covers tasks started by *other* `ab` processes whose in-memory
-    // tracker we don't have access to.  Intentionally longer than the TUI
-    // constant to be conservative.
-    const DB_GRACE_PERIOD_SECS: i64 = 30;
-
-    let now_utc = chrono::Utc::now();
 
     for task in running_tasks {
         // Setup runs in the task's tmux session before the agent is launched.
@@ -147,20 +142,18 @@ pub fn check_completions(
                 continue;
             }
 
-            // Tier 2–4: Skip during grace period.
-            if grace_task_ids.contains(&task.id) {
+            // Capture the visible pane content once — used by Tiers 2, 3.
+            let Ok(visible) = tmux::capture_visible_pane(session) else {
+                continue;
+            };
+            // Old exit markers can remain in scrollback after another turn
+            // starts. Current work takes precedence over historical output.
+            let agent_present = tmux::pane_pid(session)
+                .ok()
+                .map(|pid| tmux::has_agent_descendant(pid, process_needle));
+            if agent_is_working(harness.as_ref(), &visible, agent_present == Some(true)) {
                 continue;
             }
-
-            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-                let age = now_utc.signed_duration_since(updated_at);
-                if age.num_seconds() < DB_GRACE_PERIOD_SECS {
-                    continue;
-                }
-            }
-
-            // Capture the visible pane content once — used by Tiers 2, 3.
-            let visible = tmux::capture_visible_pane(session).unwrap_or_default();
 
             // Tier 2: Exit marker — the wrapped command printed AB_AGENT_EXIT:
             if visible.contains(agent::EXIT_MARKER) {
@@ -215,7 +208,7 @@ pub fn check_completions(
 // Blocked → Running resumption detection
 // ---------------------------------------------------------------------------
 
-/// Check blocked (or done) tasks for signs that the agent is working again.
+/// Check tasks in any non-Running lane for signs of actual agent work.
 ///
 /// When a user attaches to a tmux session directly and gives the agent more
 /// work (bypassing `send_message`), or presses Enter to start the agent on a
@@ -241,7 +234,10 @@ pub fn check_blocked_resumptions(
             }
 
             if let Ok(visible) = tmux::capture_visible_pane(session) {
-                if harness.is_active(&visible) {
+                let agent_present = tmux::pane_pid(session)
+                    .map(|pid| tmux::has_agent_descendant(pid, harness.process_name()))
+                    .unwrap_or(false);
+                if agent_is_working(harness.as_ref(), &visible, agent_present) {
                     let _ = store.update_status(&task.id, TaskStatus::Running);
                     resumed.push(task.id.clone());
                 }
@@ -391,6 +387,7 @@ pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
 
         // 5. Update the task in the DB (ensure session name is correct)
         let mut updated = task.clone();
+        updated.status = TaskStatus::Blocked;
         updated.tmux_session = Some(session.clone());
         updated.agent_cli = Some(harness.name().to_owned());
         if let Err(e) = store.update_task(&updated) {
@@ -598,7 +595,7 @@ pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool)
 
     // Update task in DB
     let mut updated = task.clone();
-    updated.status = TaskStatus::Running;
+    updated.status = TaskStatus::Blocked;
     updated.worktree_path = if branch.is_some() {
         Some(execution_path)
     } else {
@@ -660,7 +657,8 @@ pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
     }
 
     let mut updated = task.clone();
-    updated.status = TaskStatus::Running;
+    // Launching the CLI is not evidence that it has started processing work.
+    updated.status = task.status.clone();
     updated.worktree_path = uses_worktree.then_some(wt_path);
     updated.tmux_session = Some(session);
     updated.agent_cli = Some(harness.name().to_owned());
@@ -676,9 +674,8 @@ pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
 /// tmux session is dead. Harnesses that support persisted conversations can
 /// resume them; others start again with the original prompt.
 ///
-/// The caller controls the task's status via `desired_status` — Blocked
-/// tasks stay Blocked (user decides next steps), Done tasks stay Done.
-pub fn resume_task(store: &TaskStore, task: &Task, desired_status: TaskStatus) -> Result<Task> {
+/// Reopening preserves the lane; activity detection alone marks work Running.
+pub fn resume_task(store: &TaskStore, task: &Task) -> Result<Task> {
     // Clean up old session if still around
     if let Some(ref session) = task.tmux_session {
         let _ = tmux::kill_session(session);
@@ -709,7 +706,7 @@ pub fn resume_task(store: &TaskStore, task: &Task, desired_status: TaskStatus) -
     }
 
     let mut updated = task.clone();
-    updated.status = desired_status;
+    updated.status = task.status.clone();
     updated.worktree_path = uses_worktree.then_some(wt_path);
     updated.tmux_session = Some(session);
     updated.agent_cli = Some(harness.name().to_owned());
@@ -734,7 +731,7 @@ pub fn kill_task(store: &TaskStore, task: &Task) -> Result<Task> {
 
 /// Send a message/command to a running or blocked agent.
 ///
-/// If the task is Blocked, it is moved back to Running (the agent got new work).
+/// Sending input preserves the lane until activity detection observes work.
 /// Returns the updated task.
 pub fn send_message(store: &TaskStore, task: &Task, message: &str) -> Result<Task> {
     let session = task
@@ -774,9 +771,6 @@ pub fn send_message(store: &TaskStore, task: &Task, message: &str) -> Result<Tas
 
     let mut updated = task.clone();
     updated.agent_cli = Some(harness.name().to_owned());
-    if task.status == TaskStatus::Blocked {
-        updated.status = TaskStatus::Running;
-    }
     if updated.status != task.status || updated.agent_cli != task.agent_cli {
         store.update_task(&updated)?;
     }
@@ -870,6 +864,25 @@ fn truncate(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::store::TaskStatus;
+
+    #[test]
+    fn activity_requires_work_and_a_live_agent() {
+        let harness = agent::harness_for("codex").unwrap();
+        let working = "• Working (2s • esc to interrupt)\n›";
+        assert!(agent_is_working(harness.as_ref(), working, true));
+        assert!(!agent_is_working(harness.as_ref(), working, false));
+        assert!(!agent_is_working(
+            harness.as_ref(),
+            "› Inspect this task",
+            true
+        ));
+        // A previous command's exit marker must not hide current work.
+        assert!(agent_is_working(
+            harness.as_ref(),
+            &format!("{}0\n{}", agent::EXIT_MARKER, working),
+            true
+        ));
+    }
 
     fn test_task(title: &str, description: &str) -> Task {
         Task {

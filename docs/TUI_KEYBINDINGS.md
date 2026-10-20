@@ -22,7 +22,7 @@
 | `p` | Open the quick prompts palette |
 | `K` | Kill a running task (with confirmation) |
 | `D` | Advance: Blocked → Review → Done (or Running → Done) |
-| `R` | Restart a blocked/done/keep task |
+| `R` | Restart a blocked/review/done/keep task; detected agent work moves it to Running |
 | `k` | Send the selected task to the Keep lane |
 | `v` / `L` | Configure visible lanes and their order |
 | `V` | Reveal all lanes hidden by configuration for this session |
