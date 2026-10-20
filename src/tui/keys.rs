@@ -114,7 +114,7 @@ pub fn handle_normal_key(
 
         // Enter: context-dependent action
         KeyCode::Enter => {
-            if let Some(task) = app.selected_task() {
+            if let Some(task) = app.selected_task().cloned() {
                 match task.status {
                     TaskStatus::Running
                     | TaskStatus::Blocked
@@ -127,6 +127,16 @@ pub fn handle_normal_key(
                             .is_some_and(|s| tmux::session_exists(s));
 
                         if session_alive {
+                            if task.status == TaskStatus::Review {
+                                // Opening a Review task means work is resuming;
+                                // move it back to Running before attaching.
+                                orchestrator::set_task_status(
+                                    &app.store,
+                                    &task,
+                                    TaskStatus::Running,
+                                )?;
+                                app.refresh_now()?;
+                            }
                             let session = task.tmux_session.as_ref().unwrap().clone();
                             tmux::ensure_task_windows(
                                 &session,
@@ -147,9 +157,11 @@ pub fn handle_normal_key(
                             // again, so move it into Running — it will show up in the
                             // Running column and completion detection will move it to
                             // Blocked when the agent finishes. Running/Blocked keep
-                            // their current status.
+                            // Review tasks also return to Running when work resumes.
                             let desired_status = match task.status {
-                                TaskStatus::Done | TaskStatus::Keep => TaskStatus::Running,
+                                TaskStatus::Done | TaskStatus::Keep | TaskStatus::Review => {
+                                    TaskStatus::Running
+                                }
                                 ref other => other.clone(),
                             };
                             match orchestrator::resume_task(&app.store, &task_clone, desired_status)
