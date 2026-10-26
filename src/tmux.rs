@@ -284,13 +284,22 @@ pub fn attach_session(session: &str) -> Result<()> {
 
 /// Attach to a task while continuing to run the board's activity checks.
 /// The board's normal event loop is paused for the duration of the attach.
+///
+/// The child's exit (the user detaching with `Ctrl+b d`) is polled at a short
+/// interval so the board reappears almost immediately on detach. The supplied
+/// `poll` callback — the board's periodic refresh — runs on a slower cadence
+/// so it does not spawn subprocess work every tick.
 pub fn attach_session_with_poll(session: &str, mut poll: impl FnMut()) -> Result<()> {
+    const EXIT_POLL: Duration = Duration::from_millis(100);
+    const CALLBACK_INTERVAL: Duration = Duration::from_secs(2);
+
     let target = agent_target(session);
     let mut child = Command::new("tmux")
         .args(["attach-session", "-t", &target])
         .spawn()
         .context("failed to spawn tmux attach-session")?;
 
+    let mut last_callback = Instant::now();
     loop {
         if let Some(status) = child
             .try_wait()
@@ -301,8 +310,11 @@ pub fn attach_session_with_poll(session: &str, mut poll: impl FnMut()) -> Result
             }
             return Ok(());
         }
-        poll();
-        thread::sleep(Duration::from_secs(2));
+        if last_callback.elapsed() >= CALLBACK_INTERVAL {
+            poll();
+            last_callback = Instant::now();
+        }
+        thread::sleep(EXIT_POLL);
     }
 }
 
@@ -340,6 +352,34 @@ pub fn session_exists(session: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// List the names of all live tmux sessions in a single call.
+///
+/// This replaces per-task `has-session` probing: one `tmux list-sessions`
+/// spawn yields every session name, which the caller can diff against the
+/// sessions it cares about. If the tmux server isn't running (no sessions),
+/// `list-sessions` exits non-zero — that is treated as an empty set, not an
+/// error.
+pub fn list_sessions() -> Vec<String> {
+    let output = match Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+
+    if !output.status.success() {
+        // No server / no sessions → empty list.
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Wait until an agent process appears in a session's pane process tree.
