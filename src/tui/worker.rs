@@ -211,7 +211,9 @@ impl Worker {
         };
 
         self.refresh_sessions(&tasks);
-        let _ = self.upd_tx.send(WorkerUpdate::Sessions(self.session_alive.clone()));
+        let _ = self
+            .upd_tx
+            .send(WorkerUpdate::Sessions(self.session_alive.clone()));
 
         self.detect_activity(&tasks);
     }

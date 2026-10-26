@@ -353,8 +353,7 @@ impl App {
     /// synchronous path (the initial reconcile before the worker is spawned);
     /// once the worker is running it owns this map and pushes updates.
     pub fn check_sessions(&mut self) {
-        let live: std::collections::HashSet<String> =
-            tmux::list_sessions().into_iter().collect();
+        let live: std::collections::HashSet<String> = tmux::list_sessions().into_iter().collect();
         self.session_alive.clear();
         for task in &self.tasks {
             if let Some(ref session) = task.tmux_session {
@@ -382,8 +381,7 @@ impl App {
 
     /// The tmux session of the currently-selected task, if any.
     fn selected_session(&self) -> Option<String> {
-        self.selected_task()
-            .and_then(|t| t.tmux_session.clone())
+        self.selected_task().and_then(|t| t.tmux_session.clone())
     }
 
     /// Tell the worker which session to preview. When no worker is attached
@@ -424,9 +422,7 @@ impl App {
             let ids: std::collections::HashSet<String> = self
                 .task_started_at
                 .iter()
-                .filter(|(_, started)| {
-                    now.duration_since(**started) < TASK_START_GRACE_PERIOD
-                })
+                .filter(|(_, started)| now.duration_since(**started) < TASK_START_GRACE_PERIOD)
                 .map(|(id, _)| id.clone())
                 .collect();
             worker.send(super::worker::WorkerRequest::Grace(ids));
@@ -457,7 +453,10 @@ impl App {
                         self.detail_session = session;
                     }
                 }
-                super::worker::WorkerUpdate::TasksChanged { notification, bell: b } => {
+                super::worker::WorkerUpdate::TasksChanged {
+                    notification,
+                    bell: b,
+                } => {
                     tasks_changed = true;
                     bell = bell || b;
                     if let Some((msg, success)) = notification {
