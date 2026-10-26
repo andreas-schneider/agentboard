@@ -8,6 +8,7 @@
 mod app;
 mod keys;
 mod render;
+mod worker;
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -16,7 +17,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -50,6 +51,41 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     )
     .context("failed to leave alternate screen")?;
     terminal.show_cursor().context("failed to show cursor")?;
+    Ok(())
+}
+
+/// Re-enter the board TUI after handing the terminal to an external program
+/// (e.g. a `tmux attach`). This is the inverse of [`restore_terminal`].
+///
+/// Crucially it draws one board frame *before returning*, so the alternate
+/// screen is painted over immediately. Otherwise the user briefly sees the
+/// underlying shell — including tmux's `[detached (from session ...)]` lines
+/// printed on detach — until the event loop's next draw.
+pub(crate) fn reenter_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    enable_raw_mode().context("failed to re-enable raw mode")?;
+    // Wipe the normal screen buffer first so tmux's "[detached ...]" lines (and
+    // any other output printed while we were away) don't flash before the
+    // alternate screen takes over.
+    execute!(
+        terminal.backend_mut(),
+        Clear(ClearType::All),
+        EnterAlternateScreen,
+        EnableBracketedPaste
+    )
+    .context("failed to re-enter alternate screen")?;
+    // Discard any input (stray keystrokes, mouse reports) that accumulated
+    // while we were detached so it doesn't replay into the board.
+    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        let _ = event::read();
+    }
+    terminal.clear().context("failed to clear terminal")?;
+    // Paint immediately so nothing from the normal screen buffer shows through.
+    terminal
+        .draw(|frame| render::ui(frame, app))
+        .context("failed to draw frame")?;
     Ok(())
 }
 
@@ -114,6 +150,12 @@ pub fn run_board(repo_filter: Option<String>) -> Result<()> {
     // Reconcile persisted task states before the first board frame. An idle
     // agent may have finished while no board process was running.
     app.refresh_now()?;
+
+    // All blocking tmux / process work now runs on a background thread so the
+    // event loop never stalls on subprocess spawns. Attach after the initial
+    // synchronous reconcile so the first frame already has session state.
+    app.attach_worker(worker::WorkerHandle::spawn());
+
     let mut terminal = setup_terminal()?;
 
     let result = run_event_loop(&mut terminal, &mut app);

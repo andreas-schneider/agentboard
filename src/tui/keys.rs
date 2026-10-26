@@ -1,11 +1,9 @@
 //! Keyboard input handling for each input mode.
 
-use std::io::{self, Stdout};
+use std::io::Stdout;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -15,7 +13,7 @@ use crate::store::TaskStatus;
 use crate::tmux;
 
 use super::app::{App, InputField, InputMode, Notification, PendingAction};
-use super::restore_terminal;
+use super::{reenter_terminal, restore_terminal};
 
 // ---------------------------------------------------------------------------
 // Normal mode
@@ -136,11 +134,8 @@ pub fn handle_normal_key(
                             let _ = tmux::attach_session_with_poll(&session, || {
                                 let _ = app.refresh_now();
                             });
-                            enable_raw_mode().context("failed to re-enable raw mode")?;
-                            execute!(io::stdout(), EnterAlternateScreen)
-                                .context("failed to re-enter alternate screen")?;
-                            terminal.clear().context("failed to clear terminal")?;
                             app.refresh_now()?;
+                            reenter_terminal(terminal, app)?;
                         } else {
                             // No live session — resume the configured harness and attach.
                             // Preserve the lane until activity detection observes work.
@@ -169,12 +164,8 @@ pub fn handle_normal_key(
                                                 tmux::attach_session_with_poll(&session, || {
                                                     let _ = app.refresh_now();
                                                 });
-                                            enable_raw_mode()
-                                                .context("failed to re-enable raw mode")?;
-                                            execute!(io::stdout(), EnterAlternateScreen)
-                                                .context("failed to re-enter alternate screen")?;
-                                            terminal.clear().context("failed to clear terminal")?;
                                             app.refresh_now()?;
+                                            reenter_terminal(terminal, app)?;
                                         } else {
                                             app.notify(Notification::warn(
                                                 "Session created but not alive",

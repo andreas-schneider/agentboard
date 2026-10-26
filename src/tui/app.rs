@@ -154,6 +154,9 @@ pub struct App {
 
     // Detail sidebar
     pub detail_lines: String,
+    /// The tmux session that `detail_lines` was captured from. Used to drop
+    /// stale captures delivered by the worker after the selection moved on.
+    pub detail_session: Option<String>,
     /// Number of lines to scroll up from the bottom when the user has
     /// manually moved away from the live tail.
     pub detail_scroll: u16,
@@ -165,6 +168,10 @@ pub struct App {
 
     // Session alive cache (checked periodically, not every frame)
     pub session_alive: std::collections::HashMap<String, bool>,
+
+    // Background worker that performs all blocking tmux / process work off the
+    // UI thread. `None` in unit tests, where no board loop is running.
+    pub worker: Option<super::worker::WorkerHandle>,
 
     // Grace period: tracks when each task was started/restarted so we can
     // suppress premature completion detection.  Keyed by task ID.
@@ -200,11 +207,13 @@ impl App {
             should_quit: false,
             store,
             detail_lines: String::new(),
+            detail_session: None,
             detail_scroll: 0,
             detail_at_bottom: true,
             last_refresh: now,
             last_detail_capture: now - REFRESH_INTERVAL, // force initial capture
             session_alive: std::collections::HashMap::new(),
+            worker: None,
             task_started_at: std::collections::HashMap::new(),
             notification: None,
             input_mode: InputMode::Normal,
@@ -339,12 +348,18 @@ impl App {
 
     // -- Session alive checks -----------------------------------------------
 
+    /// Refresh the session-liveness map using a single `tmux list-sessions`
+    /// call rather than one `has-session` spawn per task. Used on the
+    /// synchronous path (the initial reconcile before the worker is spawned);
+    /// once the worker is running it owns this map and pushes updates.
     pub fn check_sessions(&mut self) {
+        let live: std::collections::HashSet<String> =
+            tmux::list_sessions().into_iter().collect();
         self.session_alive.clear();
         for task in &self.tasks {
             if let Some(ref session) = task.tmux_session {
-                let alive = tmux::session_exists(session);
-                self.session_alive.insert(session.clone(), alive);
+                self.session_alive
+                    .insert(session.clone(), live.contains(session));
             }
         }
     }
@@ -355,29 +370,167 @@ impl App {
             .and_then(|s| self.session_alive.get(s).copied())
     }
 
+    // -- Worker plumbing ----------------------------------------------------
+
+    /// Attach the background worker and prime it with the current selection.
+    /// Called once by the event loop after the first synchronous reconcile.
+    pub fn attach_worker(&mut self, worker: super::worker::WorkerHandle) {
+        self.worker = Some(worker);
+        self.send_grace_to_worker();
+        self.request_detail_capture(true);
+    }
+
+    /// The tmux session of the currently-selected task, if any.
+    fn selected_session(&self) -> Option<String> {
+        self.selected_task()
+            .and_then(|t| t.tmux_session.clone())
+    }
+
+    /// Tell the worker which session to preview. When no worker is attached
+    /// (unit tests, or the pre-loop reconcile), fall back to a synchronous
+    /// capture so behaviour is unchanged.
+    fn request_detail_capture(&mut self, force: bool) {
+        self.detail_scroll = 0;
+        self.detail_at_bottom = true;
+        let session = self.selected_session();
+
+        match &self.worker {
+            Some(worker) => {
+                if force {
+                    worker.send(super::worker::WorkerRequest::RefreshNow {
+                        session: session.clone(),
+                    });
+                } else {
+                    worker.send(super::worker::WorkerRequest::Select {
+                        session: session.clone(),
+                    });
+                }
+                // Reflect the pending selection immediately so the preview
+                // doesn't show the previous task while the capture is in
+                // flight; the worker's Detail update fills in the content.
+                if self.detail_session != session {
+                    self.detail_lines = String::new();
+                    self.detail_session = session;
+                }
+            }
+            None => self.capture_detail_sync(),
+        }
+    }
+
+    /// Push the current grace-period task-id set to the worker.
+    fn send_grace_to_worker(&self) {
+        if let Some(worker) = &self.worker {
+            let now = Instant::now();
+            let ids: std::collections::HashSet<String> = self
+                .task_started_at
+                .iter()
+                .filter(|(_, started)| {
+                    now.duration_since(**started) < TASK_START_GRACE_PERIOD
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            worker.send(super::worker::WorkerRequest::Grace(ids));
+        }
+    }
+
+    /// Drain cached results from the worker and apply them to UI state.
+    /// Returns `true` if the terminal bell should ring.
+    pub fn apply_worker_updates(&mut self) -> bool {
+        let updates = match &self.worker {
+            Some(worker) => worker.drain(),
+            None => return false,
+        };
+
+        let mut bell = false;
+        let mut tasks_changed = false;
+
+        for update in updates {
+            match update {
+                super::worker::WorkerUpdate::Sessions(map) => {
+                    self.session_alive = map;
+                }
+                super::worker::WorkerUpdate::Detail { session, text } => {
+                    // Discard stale captures: only apply if this is still the
+                    // selected session.
+                    if session == self.selected_session() {
+                        self.detail_lines = text;
+                        self.detail_session = session;
+                    }
+                }
+                super::worker::WorkerUpdate::TasksChanged { notification, bell: b } => {
+                    tasks_changed = true;
+                    bell = bell || b;
+                    if let Some((msg, success)) = notification {
+                        self.notify(Notification::completion(msg, success));
+                    }
+                }
+            }
+        }
+
+        if tasks_changed {
+            // The worker changed task state in the store; reload our view.
+            if let Ok(tasks) = self.store.list_tasks() {
+                self.tasks = tasks;
+                self.clamp_row();
+            }
+            // Clear grace entries for tasks that are no longer Running so the
+            // worker stops considering them.
+            let running: std::collections::HashSet<String> = self
+                .tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Running)
+                .map(|t| t.id.clone())
+                .collect();
+            self.task_started_at.retain(|id, _| running.contains(id));
+            self.send_grace_to_worker();
+        }
+
+        bell
+    }
+
     // -- Auto-refresh -------------------------------------------------------
 
-    /// Periodic refresh: reload tasks, check sessions, detect completions.
-    /// Returns `true` if the terminal bell should ring (agent completed).
+    /// Per-frame housekeeping. With the worker attached this does no blocking
+    /// work — it only drains cached results and expires grace entries. The
+    /// returned flag indicates whether the terminal bell should ring.
     pub fn auto_refresh(&mut self) -> Result<bool> {
+        if self.worker.is_some() {
+            // Expire stale grace entries and keep the worker's view current.
+            let now = Instant::now();
+            let before = self.task_started_at.len();
+            self.task_started_at
+                .retain(|_, started| now.duration_since(*started) < TASK_START_GRACE_PERIOD);
+            if self.task_started_at.len() != before {
+                self.send_grace_to_worker();
+            }
+            return Ok(self.apply_worker_updates());
+        }
+
+        // Fallback (no worker): original synchronous behaviour.
         let now = Instant::now();
         let mut bell = false;
-
         if now.duration_since(self.last_refresh) >= REFRESH_INTERVAL {
             bell = self.refresh_now_with_activity()?;
             self.last_refresh = now;
         }
-
-        // Auto-capture detail for selected task
         if now.duration_since(self.last_detail_capture) >= REFRESH_INTERVAL {
-            self.capture_detail();
+            self.capture_detail_sync();
             self.last_detail_capture = now;
         }
-
         Ok(bell)
     }
 
+    /// Force an immediate refresh. Reloads tasks synchronously (cheap, DB
+    /// only) and asks the worker to re-run its tmux cycle now. On the
+    /// worker-less path it performs the full synchronous cycle.
     pub fn refresh_now(&mut self) -> Result<()> {
+        if self.worker.is_some() {
+            self.tasks = self.store.list_tasks()?;
+            self.clamp_row();
+            self.send_grace_to_worker();
+            self.request_detail_capture(true);
+            return Ok(());
+        }
         self.refresh_now_with_activity().map(|_| ())
     }
 
@@ -386,15 +539,14 @@ impl App {
         self.clamp_row();
         self.check_sessions();
         let bell = self.detect_activity()?;
-        self.capture_detail();
+        self.capture_detail_sync();
         self.last_refresh = Instant::now();
         self.last_detail_capture = Instant::now();
         Ok(bell)
     }
 
     /// Detect agent completion or resumption using the currently loaded tasks.
-    /// This is shared by periodic refreshes and explicit refreshes, including
-    /// the refresh performed when returning from an attached tmux session.
+    /// Synchronous path only (used when no worker is attached).
     fn detect_activity(&mut self) -> Result<bool> {
         let now = Instant::now();
 
@@ -458,12 +610,22 @@ impl App {
 
     // -- Detail capture -----------------------------------------------------
 
+    /// Request a refresh of the selected task's live preview. Cheap: with the
+    /// worker attached this only sends a message; the actual `tmux` capture
+    /// happens off-thread and is debounced across rapid navigation.
     pub fn capture_detail(&mut self) {
+        self.request_detail_capture(false);
+    }
+
+    /// Synchronous `tmux capture-pane` for the selected task. Used only on the
+    /// worker-less fallback path (initial reconcile, unit tests).
+    fn capture_detail_sync(&mut self) {
+        let session = self.selected_session();
         self.detail_lines = match self.selected_task() {
             Some(task) => {
-                if let Some(ref session) = task.tmux_session {
+                if let Some(ref s) = task.tmux_session {
                     if self.is_session_alive(task) != Some(false) {
-                        tmux::capture_last_lines(session, DETAIL_CAPTURE_LINES)
+                        tmux::capture_last_lines(s, DETAIL_CAPTURE_LINES)
                             .unwrap_or_else(|_| "(could not capture output)".to_string())
                     } else {
                         "(session ended)".to_string()
@@ -474,6 +636,7 @@ impl App {
             }
             None => String::new(),
         };
+        self.detail_session = session;
         self.detail_scroll = 0;
         self.detail_at_bottom = true;
     }
@@ -981,11 +1144,13 @@ mod tests {
             should_quit: false,
             store: TaskStore::open_in_memory().unwrap(),
             detail_lines: String::new(),
+            detail_session: None,
             detail_scroll: 0,
             detail_at_bottom: true,
             last_refresh: Instant::now(),
             last_detail_capture: Instant::now(),
             session_alive: Default::default(),
+            worker: None,
             task_started_at: Default::default(),
             notification: None,
             input_mode: InputMode::Normal,
