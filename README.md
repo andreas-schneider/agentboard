@@ -72,6 +72,7 @@ Essential controls:
 | `k` | Send the selected task to the Keep lane |
 | `v` / `L` | Configure visible lanes and their order |
 | `V` | Reveal all configured lanes for the current session |
+| `x` | Delete the selected task (confirm if it has unmerged or uncommitted work) |
 | `?` | Show board help |
 | `q` / `Esc` | Quit the board or exit scroll mode in the session |
 | `Ctrl+b`, then `d` | Detach from an agent session and return to the board |
@@ -80,6 +81,10 @@ Essential controls:
 See the
 [complete TUI keybinding reference](docs/TUI_KEYBINDINGS.md) for task actions,
 navigation, and quick prompts.
+
+Deleting a task stops its session first, then removes it from the board while
+worktree and branch cleanup runs in the background. Failed cleanup is retained
+and retried the next time the board starts.
 
 ## Choose an agent, model, or mode
 

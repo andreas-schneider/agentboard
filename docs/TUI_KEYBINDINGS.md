@@ -26,7 +26,13 @@
 | `k` | Send the selected task to the Keep lane |
 | `v` / `L` | Configure visible lanes and their order |
 | `V` | Reveal all lanes hidden by configuration for this session |
-| `x` | Delete a task (with confirmation) |
+| `x` | Delete a task (confirms first if it has unmerged commits or uncommitted files) |
+
+After confirmation, Agentboard stops a running session, then removes the task
+from the board. Worktree and branch cleanup continues in the background. If
+cleanup fails, the board shows an error and retains the cleanup job for another
+attempt when the board starts again. A normal board exit waits for queued
+cleanup to finish.
 
 The **Keep** lane is a parked column for unfinished work that is neither
 blocked nor done — for example a sketch of an idea worth revisiting later. It

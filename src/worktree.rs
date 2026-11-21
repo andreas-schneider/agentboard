@@ -67,14 +67,34 @@ pub fn create_worktree(repo_path: &str, task_id: &str, branch_name: &str) -> Res
     anyhow::bail!("git worktree add failed: {stderr}");
 }
 
-/// Remove a git worktree. Errors are intentionally ignored because the worktree
-/// may have already been cleaned up.
+/// Remove a git worktree. A missing path is safe to retry after a crash.
 pub fn cleanup_worktree(repo_path: &str, worktree_path: &str) -> Result<()> {
-    let _ = Command::new("git")
+    let output = Command::new("git")
         .args(["worktree", "remove", worktree_path, "--force"])
         .current_dir(repo_path)
-        .output();
-
+        .output()
+        .context("failed to execute git worktree remove")?;
+    if !output.status.success() {
+        if std::path::Path::new(worktree_path).exists() {
+            anyhow::bail!(
+                "git worktree remove failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // A prior attempt may have removed the directory before it could
+        // remove Git's registration. Prune that stale registration on retry.
+        let prune = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(repo_path)
+            .output()
+            .context("failed to execute git worktree prune")?;
+        if !prune.status.success() {
+            anyhow::bail!(
+                "git worktree prune failed: {}",
+                String::from_utf8_lossy(&prune.stderr)
+            );
+        }
+    }
     Ok(())
 }
 
@@ -99,8 +119,35 @@ pub fn has_unmerged_work(repo_path: &str, branch_name: &str) -> bool {
     }
 }
 
+/// Treat an unreadable worktree as unsafe to delete without confirmation.
+pub fn has_uncommitted_work(worktree_path: &str) -> bool {
+    match Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(worktree_path)
+        .output()
+    {
+        Ok(output) if output.status.success() => !output.stdout.is_empty(),
+        _ => true,
+    }
+}
+
 /// Delete a local git branch.
 pub fn delete_branch(repo_path: &str, branch_name: &str) -> Result<()> {
+    let ref_name = format!("refs/heads/{branch_name}");
+    let exists = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &ref_name])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to check git branch")?;
+    if !exists.status.success() {
+        if exists.status.code() == Some(1) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "failed to check git branch: {}",
+            String::from_utf8_lossy(&exists.stderr)
+        );
+    }
     let output = Command::new("git")
         .args(["branch", "-D", branch_name])
         .current_dir(repo_path)
@@ -330,6 +377,14 @@ mod tests {
     }
 
     #[test]
+    fn detects_uncommitted_files_before_deletion() {
+        let (_dir, repo_path) = make_temp_repo();
+        assert!(!has_uncommitted_work(&repo_path));
+        std::fs::write(std::path::Path::new(&repo_path).join("draft.txt"), "draft").unwrap();
+        assert!(has_uncommitted_work(&repo_path));
+    }
+
+    #[test]
     fn test_delete_branch_success() {
         let (_dir, repo_path) = make_temp_repo();
         // Create a branch, stay on main, then delete it
@@ -348,10 +403,9 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_branch_nonexistent() {
+    fn test_delete_branch_nonexistent_is_safe_to_retry() {
         let (_dir, repo_path) = make_temp_repo();
-        // Deleting a non-existent branch should fail
-        assert!(delete_branch(&repo_path, "no-such-branch").is_err());
+        assert!(delete_branch(&repo_path, "no-such-branch").is_ok());
     }
 
     #[test]

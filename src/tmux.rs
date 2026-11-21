@@ -336,6 +336,9 @@ pub fn kill_session(session: &str) -> Result<()> {
         if stderr_lower.contains("session not found")
             || stderr_lower.contains("no such session")
             || stderr_lower.contains("can't find session")
+            || stderr_lower.contains("no server running")
+            || (stderr_lower.contains("error connecting to")
+                && stderr_lower.contains("no such file or directory"))
         {
             return Ok(());
         }

@@ -103,6 +103,26 @@ pub struct TaskStore {
     conn: rusqlite::Connection,
 }
 
+/// Resources retained until deletion cleanup has been verified.
+#[derive(Clone, Debug)]
+pub struct PendingDeletion {
+    pub id: String,
+    pub repo_path: String,
+    pub worktree_path: Option<String>,
+    pub branch_name: Option<String>,
+    pub tmux_session: Option<String>,
+    pub last_error: Option<String>,
+}
+
+const PENDING_DELETIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pending_deletions (
+    id TEXT PRIMARY KEY,
+    repo_path TEXT NOT NULL,
+    worktree_path TEXT,
+    branch_name TEXT,
+    tmux_session TEXT,
+    last_error TEXT
+);";
+
 /// Add task-owned agent identity to databases created by older Agentboard
 /// versions. SQLite has no portable `ADD COLUMN IF NOT EXISTS`, so inspect the
 /// table first and keep startup migration idempotent.
@@ -188,6 +208,9 @@ impl TaskStore {
         )
         .context("failed to create deleted_tasks table")?;
 
+        conn.execute_batch(PENDING_DELETIONS_SCHEMA)
+            .context("failed to create pending_deletions table")?;
+
         Ok(Self { conn })
     }
 
@@ -235,6 +258,9 @@ impl TaskStore {
             );",
         )
         .context("failed to create deleted_tasks table")?;
+
+        conn.execute_batch(PENDING_DELETIONS_SCHEMA)
+            .context("failed to create pending_deletions table")?;
 
         Ok(Self { conn })
     }
@@ -483,23 +509,79 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Log a task deletion for audit purposes.
-    pub fn log_deletion(&self, task: &Task, had_unmerged_work: bool) -> Result<()> {
+    /// Record a deletion and remove the task in one transaction. Resource
+    /// cleanup can then run independently without leaving a visible task.
+    pub fn remove_task_with_audit(&self, task: &Task, had_unmerged_work: bool) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT OR REPLACE INTO deleted_tasks (id, title, branch_name, repo_path, deleted_at, had_unmerged_work)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                task.id,
+                task.title,
+                task.branch_name,
+                task.repo_path,
+                now,
+                had_unmerged_work as i32,
+            ],
+        )
+        .context("failed to log task deletion")?;
+        tx.execute(
+            "INSERT INTO pending_deletions (id, repo_path, worktree_path, branch_name, tmux_session)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                task.id,
+                task.repo_path,
+                task.worktree_path,
+                task.branch_name,
+                task.tmux_session,
+            ],
+        )
+        .context("failed to queue task cleanup")?;
+        let rows = tx
+            .execute("DELETE FROM tasks WHERE id = ?1", params![task.id])
+            .context("failed to delete task")?;
+        if rows == 0 {
+            return Err(anyhow!("no task found with id '{}'", task.id));
+        }
+        tx.commit().context("failed to commit task deletion")?;
+        Ok(())
+    }
+
+    pub fn pending_deletions(&self) -> Result<Vec<PendingDeletion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, repo_path, worktree_path, branch_name, tmux_session, last_error
+             FROM pending_deletions ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingDeletion {
+                id: row.get(0)?,
+                repo_path: row.get(1)?,
+                worktree_path: row.get(2)?,
+                branch_name: row.get(3)?,
+                tmux_session: row.get(4)?,
+                last_error: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to load pending deletions")
+    }
+
+    pub fn finish_pending_deletion(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM pending_deletions WHERE id = ?1", params![id])
+            .context("failed to finish task cleanup")?;
+        Ok(())
+    }
+
+    pub fn fail_pending_deletion(&self, id: &str, error: &str) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO deleted_tasks (id, title, branch_name, repo_path, deleted_at, had_unmerged_work)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    task.id,
-                    task.title,
-                    task.branch_name,
-                    task.repo_path,
-                    now,
-                    had_unmerged_work as i32,
-                ],
+                "UPDATE pending_deletions SET last_error = ?2 WHERE id = ?1",
+                params![id, error],
             )
-            .context("failed to log task deletion")?;
+            .context("failed to record task cleanup error")?;
         Ok(())
     }
 
@@ -523,19 +605,6 @@ impl TaskStore {
             )
             .context("failed to claim task for restore")?;
         Ok(rows > 0)
-    }
-
-    /// Delete a task by id.
-    pub fn delete_task(&self, id: &str) -> Result<()> {
-        let rows = self
-            .conn
-            .execute("DELETE FROM tasks WHERE id = ?1", params![id])
-            .context("failed to delete task")?;
-
-        if rows == 0 {
-            return Err(anyhow!("no task found with id '{}'", id));
-        }
-        Ok(())
     }
 }
 
@@ -802,27 +871,37 @@ mod tests {
     }
 
     #[test]
-    fn delete_task() {
+    fn remove_task_with_audit_is_atomic() {
         let store = test_store();
         let task = store.create_task("Delete me", "", "/tmp/repo").unwrap();
 
-        store.delete_task(&task.id).unwrap();
+        store.remove_task_with_audit(&task, true).unwrap();
+        assert!(store.get_task(&task.id).is_err());
+        let pending = store.pending_deletions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, task.id);
+        assert_eq!(pending[0].repo_path, task.repo_path);
+        let had_unmerged: i32 = store
+            .conn
+            .query_row(
+                "SELECT had_unmerged_work FROM deleted_tasks WHERE id = ?1",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(had_unmerged, 1);
 
-        let result = store.get_task(&task.id);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn delete_task_nonexistent() {
-        let store = test_store();
-        let result = store.delete_task("does-not-exist");
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("no task found"),
-            "expected 'no task found' error, got: {}",
-            err_msg
-        );
+        assert!(store.remove_task_with_audit(&task, false).is_err());
+        let still_unmerged: i32 = store
+            .conn
+            .query_row(
+                "SELECT had_unmerged_work FROM deleted_tasks WHERE id = ?1",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_unmerged, 1);
+        assert_eq!(store.pending_deletions().unwrap().len(), 1);
     }
 
     #[test]
@@ -868,17 +947,5 @@ mod tests {
         // Task is Backlog, not Running — claim should fail
         let claimed = store.claim_for_restore(&task.id, &task.updated_at).unwrap();
         assert!(!claimed, "claim should fail for non-Running task");
-    }
-
-    #[test]
-    fn log_deletion() {
-        let store = test_store();
-        let task = store
-            .create_task("Log deletion", "desc", "/tmp/repo")
-            .unwrap();
-
-        // Should not crash
-        store.log_deletion(&task, false).unwrap();
-        store.log_deletion(&task, true).unwrap(); // second call exercises OR REPLACE
     }
 }

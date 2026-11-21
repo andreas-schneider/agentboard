@@ -445,6 +445,29 @@ impl App {
                 super::worker::WorkerUpdate::Sessions(map) => {
                     self.session_alive = map;
                 }
+                super::worker::WorkerUpdate::CleanupFinished {
+                    id,
+                    error,
+                    recovered,
+                } => {
+                    if let Some(error) = error {
+                        self.notify(Notification::error(format!(
+                            "Cleanup pending for {}: {}",
+                            &id[..8],
+                            error
+                        )));
+                    } else {
+                        self.notify(Notification::info(format!(
+                            "{} for task {}",
+                            if recovered {
+                                "Cleanup recovered"
+                            } else {
+                                "Cleanup finished"
+                            },
+                            &id[..8]
+                        )));
+                    }
+                }
                 super::worker::WorkerUpdate::Detail { session, text } => {
                     // Discard stale captures: only apply if this is still the
                     // selected session.
@@ -814,15 +837,65 @@ impl App {
         Ok(())
     }
 
-    pub fn delete_task(&mut self, id: &str) -> Result<()> {
+    pub fn delete_task(&mut self, id: &str, confirmed: bool) -> Result<()> {
         let task = self.store.get_task(id)?;
+        // Stop a live agent before removing its task from the board. Otherwise
+        // it could keep writing while earlier jobs delay background cleanup.
+        if let Some(session) = &task.tmux_session {
+            tmux::kill_session(session).context("failed to stop task before deletion")?;
+        }
+        self.finish_delete_task(task, confirmed)
+    }
+
+    fn finish_delete_task(&mut self, task: Task, confirmed: bool) -> Result<()> {
         let short = task.id[..8].to_string();
-        orchestrator::delete_task(&self.store, &task)?;
+        // New commits or uncommitted files may have appeared before the
+        // session stopped. Recheck before removing the task record.
+        let info = orchestrator::pre_delete_check(&task);
+        if !confirmed && (info.has_unmerged_work || info.has_uncommitted_work) {
+            let branch = task.branch_name.as_deref().unwrap_or("unknown");
+            self.input_mode = InputMode::Confirm {
+                prompt: format!("⚠ Branch '{}' has work that will be deleted!", branch),
+                action: PendingAction::DeleteTask(task.id.clone()),
+            };
+            return Ok(());
+        }
+        let mut stopped_task = task.clone();
+        stopped_task.tmux_session = None;
+        orchestrator::record_task_deletion(&self.store, &stopped_task, info.has_unmerged_work)?;
+        let queued = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.queue_cleanup(task.id.clone()));
+        let mut cleanup_error = None;
+        if !queued {
+            // The pre-worker path uses the same persisted job and completion
+            // rules as the asynchronous worker.
+            let pending = self.store.pending_deletions()?;
+            if let Some(job) = pending.into_iter().find(|job| job.id == task.id) {
+                match orchestrator::cleanup_deleted_task(&job) {
+                    Ok(()) => self.store.finish_pending_deletion(&job.id)?,
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        self.store.fail_pending_deletion(&job.id, &message)?;
+                        cleanup_error = Some(message);
+                    }
+                }
+            }
+        }
         self.refresh_now()?;
-        self.notify(Notification::warn(format!(
-            "Deleted task {} (branch + worktree removed)",
-            short
-        )));
+        if let Some(error) = cleanup_error {
+            self.notify(Notification::error(format!(
+                "Deleted task {}; cleanup pending: {}",
+                short, error
+            )));
+        } else {
+            self.notify(Notification::warn(format!(
+                "Deleted task {}{}",
+                short,
+                if queued { "; cleanup running" } else { "" }
+            )));
+        }
         Ok(())
     }
 
@@ -830,19 +903,16 @@ impl App {
         let task = self.store.get_task(id)?;
         let info = orchestrator::pre_delete_check(&task);
 
-        if info.has_unmerged_work {
+        if info.has_unmerged_work || info.has_uncommitted_work {
             // Show warning, user must confirm again
             let branch = task.branch_name.as_deref().unwrap_or("unknown");
             self.input_mode = InputMode::Confirm {
-                prompt: format!(
-                    "⚠ Branch '{}' has unmerged work! Delete anyway? (y/n)",
-                    branch
-                ),
+                prompt: format!("⚠ Branch '{}' has work that will be deleted!", branch),
                 action: PendingAction::DeleteTask(id.to_string()),
             };
         } else {
             // No unmerged work, delete directly
-            self.delete_task(id)?;
+            self.delete_task(id, false)?;
         }
         Ok(())
     }
@@ -1043,6 +1113,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn task(id: &str, status: TaskStatus, created_at: &str, updated_at: &str) -> Task {
         Task {
@@ -1273,5 +1344,59 @@ mod tests {
 
         let fetched = app.store.get_task(&created.id).unwrap();
         assert_eq!(fetched.status, TaskStatus::Keep);
+    }
+
+    #[test]
+    fn deletion_rechecks_for_new_commits_before_removing_task() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ]);
+        git(&["checkout", "-qb", "feature"]);
+        let store = TaskStore::open_in_memory().unwrap();
+        let mut task = store
+            .create_task("Delete me", "", repo.path().to_str().unwrap())
+            .unwrap();
+        task.branch_name = Some("feature".into());
+        store.update_task(&task).unwrap();
+        let mut app = App::new(store, None).unwrap();
+        assert!(!orchestrator::pre_delete_check(&task).has_unmerged_work);
+
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "new work",
+        ]);
+        git(&["checkout", "-q", "main"]);
+        app.delete_task(&task.id, false).unwrap();
+
+        assert!(app.store.get_task(&task.id).is_ok());
+        assert!(app.store.pending_deletions().unwrap().is_empty());
+        assert!(matches!(app.input_mode, InputMode::Confirm { .. }));
     }
 }
