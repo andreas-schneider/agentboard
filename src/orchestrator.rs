@@ -1,6 +1,6 @@
 use crate::agent;
 use crate::setup;
-use crate::store::{Task, TaskStatus, TaskStore};
+use crate::store::{PendingDeletion, Task, TaskStatus, TaskStore};
 use crate::tmux;
 use crate::worktree;
 use anyhow::{Context, Result};
@@ -781,6 +781,7 @@ pub fn send_message(store: &TaskStore, task: &Task, message: &str) -> Result<Tas
 /// Information about a task deletion, used to drive the TUI flow.
 pub struct DeleteInfo {
     pub has_unmerged_work: bool,
+    pub has_uncommitted_work: bool,
 }
 
 /// Check a task before deletion — returns info about unmerged work.
@@ -792,41 +793,49 @@ pub fn pre_delete_check(task: &Task) -> DeleteInfo {
         .unwrap_or(false);
     DeleteInfo {
         has_unmerged_work: has_unmerged,
+        has_uncommitted_work: task
+            .worktree_path
+            .as_ref()
+            .is_some_and(|path| worktree::has_uncommitted_work(path)),
     }
 }
 
-/// Delete a task: kill session, delete branch, clean up worktree, log deletion, remove from store.
-pub fn delete_task(store: &TaskStore, task: &Task) -> Result<()> {
+/// Remove a task from the board and record its deletion before slow cleanup.
+pub fn record_task_deletion(store: &TaskStore, task: &Task, had_unmerged: bool) -> Result<()> {
+    store.remove_task_with_audit(task, had_unmerged)
+}
+
+/// Clean up resources owned by an already-deleted task. Each step tolerates
+/// resources that a previous attempt already removed.
+pub fn cleanup_deleted_task(task: &PendingDeletion) -> Result<()> {
     // Kill tmux session if running
     if let Some(ref session) = task.tmux_session {
-        let _ = tmux::kill_session(session);
+        // Keep the worktree intact if the agent might still be writing to it.
+        tmux::kill_session(session).context("failed to remove tmux session")?;
     }
 
-    // Check for unmerged work (for logging)
-    let had_unmerged = task
-        .branch_name
-        .as_ref()
-        .map(|b| worktree::has_unmerged_work(&task.repo_path, b))
-        .unwrap_or(false);
-
+    let mut errors = Vec::new();
     // Clean up worktree first (must happen before branch delete since the worktree checks out the branch)
     if let Some(ref wt) = task.worktree_path {
         // Direct meta workspaces have no worktree_path and are intentionally
         // preserved. Git-backed meta tasks do have one and must be detached.
-        let _ = worktree::cleanup_worktree(&task.repo_path, wt);
+        if let Err(err) = worktree::cleanup_worktree(&task.repo_path, wt) {
+            errors.push(format!("failed to remove worktree: {err:#}"));
+        }
     }
 
-    // Delete the branch
+    // Git refuses to delete a checked-out branch, so it is safe to attempt
+    // this even if worktree removal failed.
     if let Some(ref branch) = task.branch_name {
-        let _ = worktree::delete_branch(&task.repo_path, branch);
+        if let Err(err) = worktree::delete_branch(&task.repo_path, branch) {
+            errors.push(format!("failed to remove branch: {err:#}"));
+        }
     }
-
-    // Log the deletion
-    let _ = store.log_deletion(task, had_unmerged);
-
-    // Remove from task store
-    store.delete_task(&task.id)?;
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(errors.join("; "))
+    }
 }
 
 /// Update a task's human-controlled status while preserving its session and
@@ -864,6 +873,55 @@ fn truncate(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::store::TaskStatus;
+    use std::process::Command;
+
+    #[test]
+    fn cleanup_attempts_branch_after_worktree_error() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let unrelated = root.path().join("not-a-worktree");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q", "-b", "main"]).status.success());
+        assert!(git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial"
+        ])
+        .status
+        .success());
+        assert!(git(&["branch", "feature"]).status.success());
+        let pending = PendingDeletion {
+            id: "12345678".into(),
+            repo_path: repo.to_string_lossy().into_owned(),
+            worktree_path: Some(unrelated.to_string_lossy().into_owned()),
+            branch_name: Some("feature".into()),
+            tmux_session: None,
+            last_error: None,
+        };
+
+        let error = cleanup_deleted_task(&pending).unwrap_err();
+
+        assert!(error.to_string().contains("failed to remove worktree"));
+        assert!(unrelated.exists());
+        assert!(
+            !git(&["show-ref", "--verify", "--quiet", "refs/heads/feature"])
+                .status
+                .success()
+        );
+    }
 
     #[test]
     fn activity_requires_work_and_a_live_agent() {

@@ -271,7 +271,7 @@ pub fn handle_normal_key(
                 if task.status == TaskStatus::Running {
                     let id = task.id.clone();
                     app.input_mode = InputMode::Confirm {
-                        prompt: format!("Kill task {}? (y/n)", &id[..8]),
+                        prompt: format!("Kill task {}?", &id[..8]),
                         action: PendingAction::KillTask(id),
                     };
                 } else {
@@ -727,18 +727,13 @@ pub fn handle_send_message_key(app: &mut App, code: KeyCode) -> Result<()> {
 // Confirm dialog
 // ---------------------------------------------------------------------------
 
-pub fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
+pub fn handle_confirm_key(app: &mut App, code: KeyCode) -> Option<PendingAction> {
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let InputMode::Confirm { ref action, .. } = app.input_mode {
                 let action = action.clone();
                 app.input_mode = InputMode::Normal;
-                match action {
-                    PendingAction::DeleteTask(id) => app.delete_task(&id)?,
-                    PendingAction::KillTask(id) => {
-                        app.kill_task(&id)?;
-                    }
-                }
+                return Some(action);
             }
         }
         _ => {
@@ -747,7 +742,7 @@ pub fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
             app.notify(Notification::info("Cancelled"));
         }
     }
-    Ok(())
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -910,10 +905,29 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_field_paste, handle_lane_config_key, handle_new_task_key};
+    use super::{
+        handle_confirm_key, handle_field_paste, handle_lane_config_key, handle_new_task_key,
+    };
     use crate::store::{TaskStatus, TaskStore};
-    use crate::tui::app::{App, InputField, InputMode};
+    use crate::tui::app::{App, InputField, InputMode, PendingAction};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn confirmation_dismisses_dialog_before_deletion_runs() {
+        let store = TaskStore::open_in_memory().unwrap();
+        let task = store.create_task("Delete", "", "/tmp/repo").unwrap();
+        let mut app = App::new(store, None).unwrap();
+        app.input_mode = InputMode::Confirm {
+            prompt: "Delete anyway?".into(),
+            action: PendingAction::DeleteTask(task.id.clone()),
+        };
+
+        let action = handle_confirm_key(&mut app, KeyCode::Char('y'));
+
+        assert!(matches!(action, Some(PendingAction::DeleteTask(id)) if id == task.id));
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.store.get_task(&task.id).is_ok());
+    }
 
     #[test]
     fn paste_inserts_multiline_text_at_cursor_without_losing_unicode() {

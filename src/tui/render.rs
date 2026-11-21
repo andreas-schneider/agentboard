@@ -9,7 +9,7 @@ use ratatui::Frame;
 use crate::prompts::QUICK_PROMPTS;
 use crate::store::TaskStatus;
 
-use super::app::{App, InputField, InputMode, REFRESH_INTERVAL};
+use super::app::{App, InputField, InputMode, PendingAction, REFRESH_INTERVAL};
 
 // ---------------------------------------------------------------------------
 // Main layout
@@ -1031,22 +1031,68 @@ fn render_send_message(frame: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_confirm_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    let overlay = centered_rect(50, 15, area);
+    // Reserve a full row for the controls, even when a long branch name wraps.
+    let width = area.width.saturating_sub(4).min(90);
+    let height = area.height.saturating_sub(2).min(7);
+    let overlay = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
     frame.render_widget(Clear, overlay);
 
-    if let InputMode::Confirm { ref prompt, .. } = app.input_mode {
+    if let InputMode::Confirm {
+        ref prompt,
+        ref action,
+    } = app.input_mode
+    {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Red))
             .title(Span::styled(
-                " Confirm ",
+                match action {
+                    PendingAction::DeleteTask(_) => " Delete anyway? ",
+                    PendingAction::KillTask(_) => " Confirm kill ",
+                },
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ));
 
-        let p = Paragraph::new(prompt.as_str())
-            .block(block)
+        let inner = block.inner(overlay);
+        frame.render_widget(block, overlay);
+        let message_area = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(1),
+        );
+        let controls_area = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            inner.height.min(1),
+        );
+        let message = Paragraph::new(prompt.as_str())
+            .wrap(Wrap { trim: true })
             .style(Style::default().fg(Color::White));
-        frame.render_widget(p, overlay);
+        frame.render_widget(message, message_area);
+        let controls = Paragraph::new(Line::from(vec![
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" yes   "),
+            Span::styled(
+                "n",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" no"),
+        ]));
+        frame.render_widget(controls, controls_area);
     }
 }
 
@@ -1258,7 +1304,44 @@ fn shorten_path(path: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cursor_row_col, wrap_text};
+    use super::{cursor_row_col, render_confirm_dialog, wrap_text};
+    use crate::store::TaskStore;
+    use crate::tui::app::{App, InputMode, PendingAction};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn confirmation_controls_remain_visible_with_long_branch() {
+        let mut app = App::new(TaskStore::open_in_memory().unwrap(), None).unwrap();
+        app.input_mode = InputMode::Confirm {
+            prompt: format!(
+                "⚠ Branch '{}' has unmerged work!",
+                "long-branch-name-".repeat(5)
+            ),
+            action: PendingAction::DeleteTask("12345678".into()),
+        };
+
+        for (width, height) in [(80, 24), (60, 16), (40, 10)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_confirm_dialog(frame, &app, frame.area()))
+                .unwrap();
+            let rows: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            assert!(
+                rows.iter().any(|row| row.contains("Delete anyway?")),
+                "{rows:?}"
+            );
+            assert!(rows.iter().any(|row| row.contains("y yes")), "{rows:?}");
+            assert!(rows.iter().any(|row| row.contains("n no")), "{rows:?}");
+        }
+    }
 
     /// Reconstruct a flat char list from wrapped lines by walking each line at
     /// its start byte. Used to sanity-check that cursor mapping lands on the

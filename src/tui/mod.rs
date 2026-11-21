@@ -23,7 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::store::TaskStore;
-use app::{App, InputMode};
+use app::{App, InputMode, PendingAction};
 
 // ---------------------------------------------------------------------------
 // Terminal setup / teardown
@@ -204,7 +204,15 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                         keys::handle_send_message_key(app, key.code)?;
                     }
                     InputMode::Confirm { .. } => {
-                        keys::handle_confirm_key(app, key.code)?;
+                        if let Some(action) = keys::handle_confirm_key(app, key.code) {
+                            // Paint the dismissed dialog before stopping a live
+                            // session, which may take longer than one frame.
+                            terminal.draw(|frame| render::ui(frame, app))?;
+                            match action {
+                                PendingAction::DeleteTask(id) => app.delete_task(&id, true)?,
+                                PendingAction::KillTask(id) => app.kill_task(&id)?,
+                            }
+                        }
                     }
                     InputMode::QuickPrompts => {
                         keys::handle_quick_prompt_key(app, key.code)?;
