@@ -524,9 +524,7 @@ fn submit_new_task(app: &mut App) -> Result<()> {
 
 pub fn handle_edit_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
-        KeyCode::Esc => {
-            app.input_mode = InputMode::Normal;
-        }
+        KeyCode::Esc => submit_edit_task(app)?,
         KeyCode::Tab | KeyCode::Down => {
             if let InputMode::EditTask {
                 ref fields,
@@ -534,7 +532,7 @@ pub fn handle_edit_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 ..
             } = app.input_mode
             {
-                *active_field = (*active_field + 1) % fields.len();
+                *active_field = (*active_field + 1) % (fields.len() + 1);
             }
         }
         KeyCode::BackTab | KeyCode::Up => {
@@ -545,7 +543,7 @@ pub fn handle_edit_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
             } = app.input_mode
             {
                 *active_field = if *active_field == 0 {
-                    fields.len() - 1
+                    fields.len()
                 } else {
                     *active_field - 1
                 };
@@ -555,17 +553,21 @@ pub fn handle_edit_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             submit_edit_task(app)?;
         }
-        KeyCode::Enter if !details_field_is_active(app) => submit_edit_task(app)?,
-        // See the corresponding New Task handler: plain Enter in Details is
-        // content, so unbracketed multi-line pastes remain inside the field.
+        KeyCode::Enter if edit_task_dialog_is_active(app) => submit_edit_task(app)?,
+        // Match New Task: Enter advances from a single-line field and inserts
+        // a newline in Details, including for unbracketed multi-line pastes.
         KeyCode::Enter => {
             if let InputMode::EditTask {
                 ref mut fields,
-                active_field,
+                ref mut active_field,
                 ..
             } = app.input_mode
             {
-                handle_field_paste(&mut fields[active_field], "\n");
+                if *active_field == 2 && *active_field < fields.len() {
+                    handle_field_paste(&mut fields[*active_field], "\n");
+                } else {
+                    *active_field = (*active_field + 1) % (fields.len() + 1);
+                }
             }
         }
         _ => {
@@ -575,7 +577,9 @@ pub fn handle_edit_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 ..
             } = app.input_mode
             {
-                handle_field_key(&mut fields[active_field], key.code);
+                if active_field < fields.len() {
+                    handle_field_key(&mut fields[active_field], key.code);
+                }
             }
         }
     }
@@ -590,8 +594,17 @@ pub fn handle_edit_task_paste(app: &mut App, text: &str) {
         ..
     } = app.input_mode
     {
-        handle_field_paste(&mut fields[active_field], text);
+        if active_field < fields.len() {
+            handle_field_paste(&mut fields[active_field], text);
+        }
     }
+}
+
+fn edit_task_dialog_is_active(app: &App) -> bool {
+    matches!(
+        &app.input_mode,
+        InputMode::EditTask { fields, active_field, .. } if *active_field == fields.len()
+    )
 }
 
 fn submit_edit_task(app: &mut App) -> Result<()> {
@@ -875,16 +888,6 @@ fn handle_field_paste(field: &mut InputField, text: &str) {
     field.cursor_pos += text.len();
 }
 
-/// The third form field is the multi-line Details editor.
-fn details_field_is_active(app: &App) -> bool {
-    match &app.input_mode {
-        InputMode::NewTask { active_field, .. } | InputMode::EditTask { active_field, .. } => {
-            *active_field == 2
-        }
-        _ => false,
-    }
-}
-
 /// Find the byte offset of the previous character boundary.
 fn prev_char_boundary(s: &str, pos: usize) -> usize {
     let mut p = pos.saturating_sub(1);
@@ -906,7 +909,8 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_confirm_key, handle_field_paste, handle_lane_config_key, handle_new_task_key,
+        handle_confirm_key, handle_edit_task_key, handle_field_paste, handle_lane_config_key,
+        handle_new_task_key,
     };
     use crate::store::{TaskStatus, TaskStore};
     use crate::tui::app::{App, InputField, InputMode, PendingAction};
@@ -985,6 +989,109 @@ mod tests {
 
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert!(app.tasks.is_empty());
+    }
+
+    #[test]
+    fn edit_task_enter_navigates_and_esc_saves() {
+        let store = TaskStore::open_in_memory().unwrap();
+        let task = store
+            .create_task("Old", "Old details", "/tmp/repo")
+            .unwrap();
+        let mut app = App::new(store, None).unwrap();
+        app.input_mode = InputMode::EditTask {
+            task_id: task.id.clone(),
+            fields: vec![
+                InputField {
+                    label: "Title",
+                    value: "New".into(),
+                    placeholder: "",
+                    cursor_pos: 3,
+                },
+                InputField {
+                    label: "Working directory",
+                    value: "/tmp/repo".into(),
+                    placeholder: "",
+                    cursor_pos: 9,
+                },
+                InputField {
+                    label: "Details",
+                    value: "Line one".into(),
+                    placeholder: "",
+                    cursor_pos: 8,
+                },
+            ],
+            active_field: 0,
+        };
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_edit_task_key(&mut app, enter).unwrap();
+        assert!(matches!(
+            app.input_mode,
+            InputMode::EditTask {
+                active_field: 1,
+                ..
+            }
+        ));
+        assert_eq!(app.store.get_task(&task.id).unwrap().title, "Old");
+
+        handle_edit_task_key(&mut app, enter).unwrap();
+        handle_edit_task_key(&mut app, enter).unwrap();
+        let InputMode::EditTask {
+            fields,
+            active_field,
+            ..
+        } = &app.input_mode
+        else {
+            panic!("expected edit form");
+        };
+        assert_eq!(*active_field, 2);
+        assert_eq!(fields[2].value, "Line one\n");
+
+        handle_edit_task_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        let saved = app.store.get_task(&task.id).unwrap();
+        assert_eq!(saved.title, "New");
+        assert_eq!(saved.description, "Line one");
+    }
+
+    #[test]
+    fn title_only_edit_uses_dialog_enter_or_ctrl_s_to_save() {
+        let store = TaskStore::open_in_memory().unwrap();
+        let task = store.create_task("Old", "Details", "/tmp/repo").unwrap();
+        let mut app = App::new(store, None).unwrap();
+        let edit_form = || InputMode::EditTask {
+            task_id: task.id.clone(),
+            fields: vec![InputField {
+                label: "Title",
+                value: "New".into(),
+                placeholder: "",
+                cursor_pos: 3,
+            }],
+            active_field: 0,
+        };
+        app.input_mode = edit_form();
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_edit_task_key(&mut app, enter).unwrap();
+        assert!(matches!(
+            app.input_mode,
+            InputMode::EditTask {
+                active_field: 1,
+                ..
+            }
+        ));
+        assert_eq!(app.store.get_task(&task.id).unwrap().title, "Old");
+        handle_edit_task_key(&mut app, enter).unwrap();
+        assert_eq!(app.store.get_task(&task.id).unwrap().title, "New");
+
+        app.input_mode = edit_form();
+        handle_edit_task_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(app.store.get_task(&task.id).unwrap().description, "Details");
     }
 
     #[test]
