@@ -47,6 +47,11 @@ restarted with `R`.
 | Key | Action |
 |-----|--------|
 | `n` | Create a new task |
+| `r` | Refresh the task list |
+| `f` | Cycle the working-directory filter |
+| `F` | Clear the working-directory filter |
+| `?` | Show the help overlay |
+| `q`/`Esc` | Quit |
 
 While creating a task, `Tab`/arrow keys navigate through the fields and the
 optional Meta task toggle. Press `Enter` or `Space` when the toggle is focused
@@ -54,11 +59,9 @@ to activate it. Meta tasks add Agentboard board/task-management context. Their
 Working directory defaults to a generated Agentboard meta-workspace but remains
 editable; a Git directory still uses a task worktree.
 
-| `r` | Refresh the task list |
-| `f` | Cycle the working-directory filter |
-| `F` | Clear the working-directory filter |
-| `?` | Show the help overlay |
-| `q`/`Esc` | Quit |
+Creating and editing use the same form keys: `Enter` advances from a single-line
+field, adds a newline in Details, and saves when the form itself is focused.
+`Esc` or `Ctrl+S` saves from any field. `Tab` and arrow keys move between fields.
 
 ## Attached agent sessions
 

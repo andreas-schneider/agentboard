@@ -656,7 +656,7 @@ fn render_new_task_form(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .title(Span::styled(
-            " New Task (Tab/Arrows: navigate, Space: toggle, Enter/Esc: save) ",
+            " New Task (Enter: next/save, Esc/Ctrl+S: save) ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -951,23 +951,11 @@ fn render_edit_task_form(frame: &mut Frame, app: &App, area: Rect) {
     let overlay = centered_rect(60, 50, area);
     frame.render_widget(Clear, overlay);
 
-    // Single-field (title-only) edits have nothing to tab between and no
-    // reason for a separate save chord, so show the simpler hint.
-    let single_field = matches!(
-        &app.input_mode,
-        InputMode::EditTask { fields, .. } if fields.len() <= 1
-    );
-    let title = if single_field {
-        " Edit Task (Enter: save, Esc: cancel) "
-    } else {
-        " Edit Task (Tab: next field, Ctrl+S: save, Esc: cancel) "
-    };
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
-            title,
+            " Edit Task (Enter: next/save, Esc/Ctrl+S: save) ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
