@@ -11,6 +11,7 @@ keywords = ["ai", "agents", "tui", "tmux", "git"]
 categories = ["command-line-utilities", "development-tools"]
 include = [
     "src/**",
+    "skills/**",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",

@@ -58,6 +58,14 @@ scroll mode with `Esc`. Switch from the session back to the board with
 For tasks that manage the Agentboard board or its tasks, enable `Meta task` in
 the New Task form. See [Meta tasks](docs/META_TASKS.md).
 
+Every Agentboard agent session also has the `agentboard-board` skill available.
+Ask a project agent to inspect or create board tasks in the normal conversation;
+the skill gives it the `ab` CLI workflow without changing its working directory.
+Opening `ab board` installs the skill for Kiro, Codex, and Copilot. Agentboard
+also checks the selected CLI's skill when it starts or resumes a task through
+the CLI. Existing live agent processes may need to be restarted to discover a
+newly installed skill.
+
 Every task has an editable working directory: Git directories run in an
 isolated worktree, while other directories are used directly.
 

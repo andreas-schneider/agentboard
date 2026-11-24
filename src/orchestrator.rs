@@ -1,5 +1,6 @@
 use crate::agent;
 use crate::setup;
+use crate::skills;
 use crate::store::{PendingDeletion, Task, TaskStatus, TaskStore};
 use crate::tmux;
 use crate::worktree;
@@ -346,6 +347,17 @@ pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
             }
         }
 
+        let harness = harness_for_task(store, task);
+        if let Err(e) = skills::install_board_skill(harness.name()) {
+            eprintln!(
+                "[restore] Failed to install board skill for {}: {}",
+                short_id, e
+            );
+            let _ = store.update_status(&task.id, TaskStatus::Blocked);
+            result.failed.push(task.id.clone());
+            continue;
+        }
+
         // 1. Create new tmux session
         if let Err(e) = tmux::create_session(&session, &wt_path) {
             eprintln!(
@@ -374,7 +386,6 @@ pub fn restore_orphaned_tasks(store: &TaskStore) -> Result<RestoreResult> {
         }
 
         // 4. Re-launch the agent using the harness's resume behavior
-        let harness = harness_for_task(store, task);
         let prompt = build_prompt(task);
         let cmd = harness.resume_command(&prompt);
         if let Err(e) = tmux::send_command(&session, &cmd) {
@@ -531,6 +542,8 @@ fn restart_execution_path(task: &Task) -> Result<(String, bool)> {
 
 /// Start a task, optionally skipping repository setup.
 pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool) -> Result<Task> {
+    let harness = agent::default_harness();
+    skills::install_board_skill(harness.name())?;
     if task.is_meta && !std::path::Path::new(&task.repo_path).exists() {
         std::fs::create_dir_all(&task.repo_path)
             .with_context(|| format!("failed to create meta workspace {}", task.repo_path))?;
@@ -567,7 +580,6 @@ pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool)
     }
 
     // If agent spawn fails, kill the tmux session and clean up worktree
-    let harness = agent::default_harness();
     let prompt = build_prompt(task);
     let agent_cmd = harness.spawn_command(&prompt);
     let cmd = if skip_setup {
@@ -625,6 +637,8 @@ pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool)
 /// new conversation, not a resume. Use when the agent was stuck or confused
 /// and resuming wouldn't help.
 pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
+    let harness = harness_for_task(store, task);
+    skills::install_board_skill(harness.name())?;
     // Clean up old session if still around
     if let Some(ref session) = task.tmux_session {
         let _ = tmux::kill_session(session);
@@ -641,7 +655,6 @@ pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
         return Err(e.context("failed to create tmux session"));
     }
 
-    let harness = harness_for_task(store, task);
     let prompt = build_prompt(task);
     let cmd = harness.spawn_command(&prompt);
     if let Err(e) = tmux::send_command(&session, &cmd) {
@@ -676,6 +689,8 @@ pub fn restart_task(store: &TaskStore, task: &Task) -> Result<Task> {
 ///
 /// Reopening preserves the lane; activity detection alone marks work Running.
 pub fn resume_task(store: &TaskStore, task: &Task) -> Result<Task> {
+    let harness = harness_for_task(store, task);
+    skills::install_board_skill(harness.name())?;
     // Clean up old session if still around
     if let Some(ref session) = task.tmux_session {
         let _ = tmux::kill_session(session);
@@ -691,7 +706,6 @@ pub fn resume_task(store: &TaskStore, task: &Task) -> Result<Task> {
         return Err(e.context("failed to create tmux session"));
     }
 
-    let harness = harness_for_task(store, task);
     let prompt = build_prompt(task);
     let cmd = harness.resume_command(&prompt);
     if let Err(e) = tmux::send_command(&session, &cmd) {
