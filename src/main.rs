@@ -4,6 +4,7 @@ mod config;
 mod orchestrator;
 mod prompts;
 mod setup;
+mod skills;
 mod store;
 mod tmux;
 mod tui;

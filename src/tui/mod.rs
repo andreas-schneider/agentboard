@@ -94,6 +94,7 @@ pub(crate) fn reenter_terminal(
 // ---------------------------------------------------------------------------
 
 pub fn run_board(repo_filter: Option<String>) -> Result<()> {
+    crate::skills::install_board_skills()?;
     let store = TaskStore::open()?;
 
     // Restore orphaned tasks (Running in DB but tmux session dead — e.g. after reboot)
