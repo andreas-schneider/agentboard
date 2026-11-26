@@ -1,6 +1,6 @@
 ---
 name: agentboard-board
-description: Manage Agentboard tasks with the ab CLI when the user asks to inspect, create, start, edit, or update tasks on the board. Use from any Agentboard agent session, including project tasks; do not use for ordinary source-code work that does not involve the board.
+description: Manage Agentboard tasks with the ab CLI when the user asks to inspect, create, schedule, start, edit, or update tasks on the board. Use from any Agentboard agent session, including project tasks; do not use for ordinary source-code work that does not involve the board.
 ---
 
 # Agentboard board
@@ -10,11 +10,14 @@ Use `ab` commands to work with the Agentboard board. Do not run `ab board` insid
 Use `ab --help` and `ab <command> --help` for exact syntax. Common commands:
 
 - `ab list` lists tasks and statuses.
-- `ab show <id>` shows task details, working directory, and recent output.
-- `ab new "title" [-d "description"] [--dir <path>] [--meta]` creates a backlog task. Use `--meta` for a task primarily about managing the board.
-- `ab start <id>` starts a backlog task.
+- `ab show <id>` shows task details, scheduled start or launch error, and recent output.
+- `ab new "title" [-d "description"] [--dir <path>] [--meta] [--at "time"]` creates a backlog task. Use `--meta` for a task primarily about managing the board.
+- `ab schedule <id> --at "time"` schedules or reschedules a backlog task. Use `ab schedule <id> --clear` to cancel its scheduled start.
+- `ab start <id>` starts a backlog task immediately, including one with a future or failed scheduled start.
 - `ab edit <id> [-t "title"] [-d "description"] [--dir <path>]` edits a backlog task.
 - `ab done <id>` marks a task Done; `ab kill <id>` stops its session.
+
+For `--at`, use a local time such as `tomorrow 09:00`, a delay such as `in 30m`, or an ISO 8601 timestamp with a UTC offset when the timezone is specified. Verify the resulting time with `ab show`.
 
 Task IDs accept unique prefixes. Inspect the relevant task with `ab show` before changing it. Preserve its working directory unless the user asks to move it. When creating a project task, provide its project directory explicitly with `--dir`; a Git directory gets a separate task worktree.
 

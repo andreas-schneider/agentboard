@@ -47,6 +47,10 @@ pub enum Commands {
         /// Give the task Agentboard board/task-management context
         #[arg(long)]
         meta: bool,
+
+        /// Schedule the start (local time, ISO timestamp with offset, or e.g. "in 30m")
+        #[arg(long)]
+        at: Option<String>,
     },
 
     /// Start a task - creates a Git worktree when applicable, then spawns an agent
@@ -58,6 +62,26 @@ pub enum Commands {
         /// Create the worktree without running repository setup
         #[arg(long)]
         skip_setup: bool,
+    },
+
+    /// Set, replace, or clear a backlog task's scheduled start
+    Schedule {
+        task_id: String,
+
+        /// Start time (e.g. "tomorrow 09:00")
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        at: Option<String>,
+
+        /// Clear the scheduled start
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Run the local task scheduler in the foreground
+    Scheduler {
+        /// Process due tasks and exit
+        #[arg(long)]
+        once: bool,
     },
 
     /// List all tasks

@@ -33,21 +33,29 @@ pub const TASK_START_GRACE_PERIOD: Duration = Duration::from_secs(15);
 pub enum InputMode {
     /// Normal navigation and actions.
     Normal,
-    /// Creating a new task: multi-field form.
-    NewTask {
+    /// Creating a task or editing a backlog task.
+    TaskForm {
+        editing: Option<(String, Option<crate::schedule::Schedule>)>,
         fields: Vec<InputField>,
         active_field: usize,
         is_meta: bool,
         previous_working_directory: Option<String>,
     },
-    /// Editing an existing backlog task: multi-field form.
+    /// Renaming a task outside the backlog.
     EditTask {
         task_id: String,
         fields: Vec<InputField>,
         active_field: usize,
     },
+    ScheduleTask {
+        task_id: String,
+        field: InputField,
+    },
     /// Sending a message/command to a running agent.
-    SendMessage { input: String, cursor_pos: usize },
+    SendMessage {
+        input: String,
+        cursor_pos: usize,
+    },
     /// Confirming a destructive action (delete, kill).
     Confirm {
         prompt: String,
@@ -677,7 +685,14 @@ impl App {
             }
             None => return Ok(()),
         };
-        let updated = orchestrator::start_task(&self.store, &task)?;
+        let updated = match orchestrator::start_task(&self.store, &task) {
+            Ok(updated) => updated,
+            Err(error) => {
+                self.refresh_now()?;
+                self.notify(Notification::error(format!("Start failed: {error:#}")));
+                return Ok(());
+            }
+        };
         self.task_started_at
             .insert(updated.id.clone(), Instant::now());
         self.refresh_now()?;
@@ -860,9 +875,13 @@ impl App {
             };
             return Ok(());
         }
-        let mut stopped_task = task.clone();
-        stopped_task.tmux_session = None;
-        orchestrator::record_task_deletion(&self.store, &stopped_task, info.has_unmerged_work)?;
+        if let Err(error) =
+            orchestrator::record_task_deletion(&self.store, &task, info.has_unmerged_work)
+        {
+            self.refresh_now()?;
+            self.notify(Notification::error(format!("Deletion failed: {error:#}")));
+            return Ok(());
+        }
         let queued = self
             .worker
             .as_ref()
@@ -952,27 +971,43 @@ impl App {
         Ok(())
     }
 
-    pub fn edit_task(
+    pub fn edit_task(&mut self, id: &str, title: &str) -> Result<()> {
+        let result = self.store.update_task_title(id, title);
+        self.finish_task_edit(id, title, result)
+    }
+
+    pub fn edit_backlog_task(
         &mut self,
         id: &str,
         title: &str,
         description: &str,
-        repo_path: &str,
+        repo: &str,
+        is_meta: bool,
+        schedule: Option<Option<crate::schedule::Schedule>>,
     ) -> Result<()> {
-        let repo = if repo_path.is_empty() {
-            std::env::current_dir()
-                .context("failed to get cwd")?
-                .to_string_lossy()
-                .to_string()
-        } else {
-            repo_path.to_string()
-        };
-        let desc = if description.is_empty() {
+        let description = if description.is_empty() {
             title
         } else {
             description
         };
-        self.store.update_task_details(id, title, desc, &repo)?;
+        let repo = if repo.is_empty() { "." } else { repo };
+        let result = self.store.update_backlog_task(
+            id,
+            title,
+            description,
+            repo,
+            is_meta,
+            schedule.as_ref().map(Option::as_ref),
+        );
+        self.finish_task_edit(id, title, result)
+    }
+
+    fn finish_task_edit(&mut self, id: &str, title: &str, result: Result<()>) -> Result<()> {
+        if let Err(error) = result {
+            self.refresh_now()?;
+            self.notify(Notification::error(format!("Edit failed: {error:#}")));
+            return Ok(());
+        }
         self.refresh_now()?;
         self.notify(Notification::info(format!(
             "Updated task: {} ({})",
@@ -988,6 +1023,7 @@ impl App {
         description: &str,
         repo_path: &str,
         is_meta: bool,
+        schedule: Option<crate::schedule::Schedule>,
     ) -> Result<()> {
         let repo = if repo_path.is_empty() {
             std::env::current_dir()
@@ -1004,7 +1040,7 @@ impl App {
         };
         let task = self
             .store
-            .create_task_with_meta(title, desc, &repo, is_meta)?;
+            .create_scheduled_task(title, desc, &repo, is_meta, schedule)?;
         self.refresh_now()?;
         self.notify(Notification::info(format!(
             "Created {} task: {} ({})",
@@ -1015,8 +1051,8 @@ impl App {
         Ok(())
     }
 
-    pub fn toggle_new_task_meta(&mut self) -> Result<()> {
-        if let InputMode::NewTask {
+    pub fn toggle_task_form_meta(&mut self) -> Result<()> {
+        if let InputMode::TaskForm {
             ref mut fields,
             ref mut is_meta,
             ref mut previous_working_directory,
@@ -1024,16 +1060,15 @@ impl App {
         } = self.input_mode
         {
             let directory = &mut fields[1];
-            if *is_meta {
-                directory.value = previous_working_directory.take().unwrap_or_default();
-                directory.cursor_pos = directory.value.len();
-                *is_meta = false;
-            } else {
-                *previous_working_directory = Some(directory.value.clone());
-                directory.value = orchestrator::suggested_meta_workspace()?;
-                directory.cursor_pos = directory.value.len();
-                *is_meta = true;
-            }
+            let next_directory = match previous_working_directory.take() {
+                Some(previous) => previous,
+                None if *is_meta => directory.value.clone(),
+                None => orchestrator::suggested_meta_workspace()?,
+            };
+            *previous_working_directory =
+                Some(std::mem::replace(&mut directory.value, next_directory));
+            directory.cursor_pos = directory.value.len();
+            *is_meta = !*is_meta;
         }
         Ok(())
     }
@@ -1053,7 +1088,22 @@ impl App {
                 let mut actions: Vec<(&str, &str)> = Vec::new();
                 match task.status {
                     TaskStatus::Backlog => {
-                        actions.push(("Enter/s", "start"));
+                        actions.push((
+                            "Enter/s",
+                            match &task.schedule {
+                                Some(schedule) if schedule.error.is_some() => "retry now",
+                                Some(_) => "start now",
+                                None => "start",
+                            },
+                        ));
+                        actions.push((
+                            "t",
+                            if task.schedule.is_some() {
+                                "reschedule"
+                            } else {
+                                "schedule"
+                            },
+                        ));
                         actions.push(("e", "edit"));
                         actions.push(("k", "keep"));
                         actions.push(("x", "delete"));
@@ -1129,6 +1179,7 @@ mod tests {
             agent_cli: None,
             created_at: created_at.to_string(),
             updated_at: updated_at.to_string(),
+            schedule: None,
         }
     }
 

@@ -6,8 +6,13 @@ project's source code.
 
 All tasks, including ordinary project tasks, can use the `agentboard-board`
 skill when asked to work with the board. Opening `ab board` installs it into
-the user skill directories for Kiro, Codex, and Copilot, before any new agent
-session launches. A meta task adds a board-focused starting prompt and an
+the user skill directories for Kiro, Codex, and Copilot. After upgrading
+Agentboard, opening the board refreshes all Agentboard-managed copies. Starting
+a task with the upgraded binary also refreshes the managed copy for its agent.
+Manually installed copies without the `.agentboard-managed` marker require a
+manual update.
+
+A meta task adds a board-focused starting prompt and an
 isolated default working directory; it is not required for occasional board
 operations.
 

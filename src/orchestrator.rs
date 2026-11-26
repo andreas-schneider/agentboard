@@ -444,8 +444,9 @@ This workspace is for board operations, not the Agentboard source repository. Do
 Use the non-interactive `ab` CLI to inspect and operate on the board. Do not run `ab board`: its TUI is for human operators.\n\n\
 * `ab list` — list tasks and statuses.\n\
 * `ab show <id>` — inspect a task and recent output.\n\
-* `ab new \"title\" [-d \"description\"] [--dir <path>] [--meta]` — create a task.\n\
-* `ab start <id>` — start a backlog task.\n\
+* `ab new \"title\" [-d \"description\"] [--dir <path>] [--meta] [--at \"time\"]` — create a task, optionally with a scheduled start.\n\
+* `ab schedule <id> --at \"time\"` / `ab schedule <id> --clear` — set or clear a scheduled start for a backlog task.\n\
+* `ab start <id>` — start a backlog task immediately.\n\
 * `ab attach <id>` — attach to another task's live session.\n\
 * `ab edit <id> [-t \"title\"] [-d \"description\"] [--dir <path>]` — edit a backlog task.\n\
 * `ab kill <id>` — stop a running task and mark it Blocked.\n\
@@ -542,7 +543,68 @@ fn restart_execution_path(task: &Task) -> Result<(String, bool)> {
 
 /// Start a task, optionally skipping repository setup.
 pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool) -> Result<Task> {
-    let harness = agent::default_harness();
+    let transaction = store.launch_transaction()?;
+    let task = store.get_task(&task.id)?;
+    anyhow::ensure!(
+        task.status == TaskStatus::Backlog,
+        "Only backlog tasks can be started"
+    );
+    let config = task.schedule.as_ref().map(|schedule| &schedule.config);
+    let updated = launch_task(store, &task, skip_setup, config)?;
+    commit_launch(transaction, &updated)?;
+    Ok(updated)
+}
+
+pub fn start_scheduled_task(store: &TaskStore, id: &str) -> Result<()> {
+    let transaction = store.launch_transaction()?;
+    // The task can be rescheduled, moved, or deleted after the due list was read.
+    if store.schedule_is_due(id, chrono::Utc::now().timestamp())? {
+        let task = store.get_task(id)?;
+        let schedule = task.schedule.as_ref().context("Missing task schedule")?;
+        match launch_task(store, &task, false, Some(&schedule.config)) {
+            Ok(updated) => return commit_launch(transaction, &updated),
+            Err(error) => store.fail_schedule(id, &format!("{error:#}"))?,
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn commit_launch(transaction: rusqlite::Transaction<'_>, task: &Task) -> Result<()> {
+    if let Err(error) = transaction.commit() {
+        if let Some(session) = &task.tmux_session {
+            tmux::kill_session(session).context("failed to clean up after launch commit failed")?;
+        }
+        if let Some(path) = &task.worktree_path {
+            worktree::cleanup_worktree(&task.repo_path, path)
+                .context("failed to clean up worktree after launch commit failed")?;
+        }
+        return Err(error).context("failed to commit started task");
+    }
+    Ok(())
+}
+
+fn launch_task(
+    store: &TaskStore,
+    task: &Task,
+    skip_setup: bool,
+    scheduled_config: Option<&crate::config::EffectiveConfig>,
+) -> Result<Task> {
+    let session = tmux::session_name(&task.id);
+    anyhow::ensure!(
+        !tmux::session_exists(&session),
+        "Task already has a tmux session: {session}"
+    );
+    let harness = if let Some(config) = scheduled_config {
+        anyhow::ensure!(
+            crate::config::program_available(&config.program),
+            "Scheduled agent program '{}' was not found on PATH",
+            config.program
+        );
+        agent::harness_for(&config.agent).context("Unsupported scheduled agent")?
+    } else {
+        agent::default_harness()
+    };
     skills::install_board_skill(harness.name())?;
     if task.is_meta && !std::path::Path::new(&task.repo_path).exists() {
         std::fs::create_dir_all(&task.repo_path)
@@ -567,11 +629,15 @@ pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool)
     };
 
     if task.is_meta {
-        write_meta_context(&execution_path, task)?;
+        if let Err(error) = write_meta_context(&execution_path, task) {
+            if branch.is_some() {
+                let _ = worktree::cleanup_worktree(&task.repo_path, &execution_path);
+            }
+            return Err(error);
+        }
     }
 
     // If tmux session creation fails, clean up the worktree
-    let session = tmux::session_name(&task.id);
     if let Err(e) = tmux::create_session(&session, &execution_path) {
         if branch.is_some() {
             let _ = worktree::cleanup_worktree(&task.repo_path, &execution_path);
@@ -581,7 +647,10 @@ pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool)
 
     // If agent spawn fails, kill the tmux session and clean up worktree
     let prompt = build_prompt(task);
-    let agent_cmd = harness.spawn_command(&prompt);
+    let agent_cmd = match scheduled_config {
+        Some(config) => agent::scheduled_command(config, &prompt),
+        None => harness.spawn_command(&prompt),
+    };
     let cmd = if skip_setup {
         agent_cmd
     } else if let Some(config) = setup_config {
@@ -616,6 +685,7 @@ pub fn start_task_with_options(store: &TaskStore, task: &Task, skip_setup: bool)
     updated.branch_name = branch;
     updated.tmux_session = Some(session.clone());
     updated.agent_cli = Some(harness.name().to_owned());
+    updated.schedule = None;
     if let Err(e) = store.update_task(&updated) {
         // The agent is already running, so leave no live session or newly
         // created worktree behind if persistence fails. Direct workspaces are
@@ -731,15 +801,19 @@ pub fn resume_task(store: &TaskStore, task: &Task) -> Result<Task> {
 
 /// Kill a running task: terminate the tmux session and mark as Blocked.
 pub fn kill_task(store: &TaskStore, task: &Task) -> Result<Task> {
-    let harness = harness_for_task(store, task);
+    let transaction = store.launch_transaction()?;
+    let task = store.get_task(&task.id)?;
+    let harness = harness_for_task(store, &task);
     if let Some(ref session) = task.tmux_session {
         tmux::kill_session(session)?;
     }
-    let mut updated = task.clone();
+    let mut updated = task;
     updated.status = TaskStatus::Blocked;
     updated.tmux_session = None;
     updated.agent_cli = Some(harness.name().to_owned());
+    updated.schedule = None;
     store.update_task(&updated)?;
+    transaction.commit()?;
     Ok(updated)
 }
 
@@ -855,11 +929,17 @@ pub fn cleanup_deleted_task(task: &PendingDeletion) -> Result<()> {
 /// Update a task's human-controlled status while preserving its session and
 /// worktree for inspection.
 pub fn set_task_status(store: &TaskStore, task: &Task, status: TaskStatus) -> Result<Task> {
-    let harness = harness_for_task(store, task);
-    let mut updated = task.clone();
+    let transaction = store.launch_transaction()?;
+    // A scheduled launch may have recorded resources since the caller read the task.
+    let mut updated = store.get_task(&task.id)?;
+    let harness = harness_for_task(store, &updated);
     updated.status = status;
     updated.agent_cli = Some(harness.name().to_owned());
+    if updated.status != TaskStatus::Backlog {
+        updated.schedule = None;
+    }
     store.update_task(&updated)?;
+    transaction.commit()?;
     Ok(updated)
 }
 
@@ -970,6 +1050,7 @@ mod tests {
             agent_cli: None,
             created_at: String::new(),
             updated_at: String::new(),
+            schedule: None,
         }
     }
 
@@ -977,6 +1058,28 @@ mod tests {
     fn build_prompt_title_only_when_description_empty() {
         let task = test_task("Fix login bug", "");
         assert_eq!(build_prompt(&task), "Fix login bug");
+    }
+
+    #[test]
+    fn done_preserves_resources_recorded_after_the_task_was_read() {
+        let store = TaskStore::open_in_memory().unwrap();
+        let backlog = store.create_task("Scheduled task", "", "/tmp").unwrap();
+        let mut launched = backlog.clone();
+        launched.status = TaskStatus::Blocked;
+        launched.branch_name = Some("task/scheduled".into());
+        launched.worktree_path = Some("/tmp/scheduled-worktree".into());
+        launched.tmux_session = Some(format!("ab-test-{}", uuid::Uuid::new_v4()));
+        launched.agent_cli = Some("codex".into());
+        store.update_task(&launched).unwrap();
+
+        done_task(&store, &backlog).unwrap();
+
+        let saved = store.get_task(&backlog.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Done);
+        assert_eq!(saved.branch_name, launched.branch_name);
+        assert_eq!(saved.worktree_path, launched.worktree_path);
+        assert_eq!(saved.tmux_session, launched.tmux_session);
+        assert_eq!(saved.agent_cli, launched.agent_cli);
     }
 
     #[test]
@@ -1008,7 +1111,8 @@ mod tests {
         assert!(context.contains("ab show <id>"));
         assert!(context.contains("tmux capture-pane"));
         assert!(context.contains("not the Agentboard source repository"));
-        assert!(context.contains("[--dir <path>] [--meta]"));
+        assert!(context.contains("[--dir <path>] [--meta] [--at \"time\"]"));
+        assert!(context.contains("ab schedule <id> --clear"));
         assert!(context.contains("Do not run `ab board`"));
         assert!(!context.contains("* `ab board`"));
         assert!(context.contains("Inspect the backlog"));

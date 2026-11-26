@@ -2,7 +2,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::params;
+use rusqlite::{params, Transaction, TransactionBehavior};
+
+use crate::schedule::Schedule;
 
 // ---------------------------------------------------------------------------
 // TaskStatus
@@ -93,6 +95,7 @@ pub struct Task {
     pub agent_cli: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub schedule: Option<Schedule>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +125,37 @@ const PENDING_DELETIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pending_delet
     tmux_session TEXT,
     last_error TEXT
 );";
+
+const SCHEDULE_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS task_schedules (
+        task_id TEXT PRIMARY KEY,
+        start_at INTEGER NOT NULL,
+        launch_config TEXT NOT NULL,
+        error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS task_schedules_due ON task_schedules(start_at) WHERE error IS NULL;
+    CREATE TRIGGER IF NOT EXISTS clear_schedule_on_status_change
+    AFTER UPDATE OF status ON tasks WHEN NEW.status != 'Backlog'
+    BEGIN DELETE FROM task_schedules WHERE task_id = NEW.id; END;
+    CREATE TRIGGER IF NOT EXISTS clear_schedule_on_delete
+    AFTER DELETE ON tasks
+    BEGIN DELETE FROM task_schedules WHERE task_id = OLD.id; END;
+";
+
+fn read_schedule(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Schedule>> {
+    let Some(at) = row.get(12)? else {
+        return Ok(None);
+    };
+    let config: String = row.get(13)?;
+    let config = toml::from_str(&config).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(Some(Schedule {
+        at,
+        config,
+        error: row.get(14)?,
+    }))
+}
 
 /// Add task-owned agent identity to databases created by older Agentboard
 /// versions. SQLite has no portable `ADD COLUMN IF NOT EXISTS`, so inspect the
@@ -211,6 +245,8 @@ impl TaskStore {
         conn.execute_batch(PENDING_DELETIONS_SCHEMA)
             .context("failed to create pending_deletions table")?;
 
+        conn.execute_batch(SCHEDULE_SCHEMA)?;
+
         Ok(Self { conn })
     }
 
@@ -262,15 +298,19 @@ impl TaskStore {
         conn.execute_batch(PENDING_DELETIONS_SCHEMA)
             .context("failed to create pending_deletions table")?;
 
+        conn.execute_batch(SCHEDULE_SCHEMA)?;
+
         Ok(Self { conn })
     }
 
     /// Create a new task with `Backlog` status and a freshly generated UUID.
+    #[cfg(test)]
     pub fn create_task(&self, title: &str, description: &str, repo_path: &str) -> Result<Task> {
         self.create_task_with_meta(title, description, repo_path, false)
     }
 
     /// Create a task, optionally with Agentboard board/task-management context.
+    #[cfg(test)]
     pub fn create_task_with_meta(
         &self,
         title: &str,
@@ -278,13 +318,30 @@ impl TaskStore {
         repo_path: &str,
         is_meta: bool,
     ) -> Result<Task> {
+        self.create_scheduled_task(title, description, repo_path, is_meta, None)
+    }
+
+    pub fn create_scheduled_task(
+        &self,
+        title: &str,
+        description: &str,
+        repo_path: &str,
+        is_meta: bool,
+        schedule: Option<Schedule>,
+    ) -> Result<Task> {
+        let transaction = schedule
+            .as_ref()
+            .map(|_| self.launch_transaction())
+            .transpose()?;
         let now = chrono::Utc::now().to_rfc3339();
         let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             title: title.to_string(),
             description: description.to_string(),
             status: TaskStatus::Backlog,
-            repo_path: repo_path.to_string(),
+            repo_path: std::path::absolute(repo_path)?
+                .to_string_lossy()
+                .into_owned(),
             is_meta,
             worktree_path: None,
             branch_name: None,
@@ -292,6 +349,7 @@ impl TaskStore {
             agent_cli: None,
             created_at: now.clone(),
             updated_at: now,
+            schedule,
         };
 
         self.conn
@@ -317,7 +375,86 @@ impl TaskStore {
             )
             .context("failed to insert task")?;
 
+        if let Some(transaction) = transaction {
+            self.write_schedule(&task.id, task.schedule.as_ref())?;
+            transaction.commit()?;
+        }
         Ok(task)
+    }
+
+    pub fn launch_transaction(&self) -> Result<Transaction<'_>> {
+        Ok(Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        )?)
+    }
+
+    pub fn set_schedule(&self, id: &str, schedule: Option<&Schedule>) -> Result<()> {
+        let transaction = self.launch_transaction()?;
+        let task = self.get_task(id)?;
+        anyhow::ensure!(
+            task.status == TaskStatus::Backlog,
+            "Only backlog tasks can be scheduled"
+        );
+        if schedule.is_some() && std::path::Path::new(&task.repo_path).is_relative() {
+            self.update_task_details(id, &task.title, &task.description, &task.repo_path)?;
+        }
+        self.write_schedule(id, schedule)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn write_schedule(&self, id: &str, schedule: Option<&Schedule>) -> Result<()> {
+        if let Some(schedule) = schedule {
+            let changed = self.conn.execute(
+                "INSERT INTO task_schedules (task_id, start_at, launch_config)
+                 SELECT id, ?2, ?3 FROM tasks WHERE id = ?1 AND status = 'Backlog'
+                 ON CONFLICT(task_id) DO UPDATE SET start_at = excluded.start_at,
+                     launch_config = excluded.launch_config, error = NULL",
+                params![id, schedule.at, toml::to_string(&schedule.config)?],
+            )?;
+            anyhow::ensure!(changed == 1, "Only backlog tasks can be scheduled");
+        } else {
+            self.conn
+                .execute("DELETE FROM task_schedules WHERE task_id = ?1", [id])?;
+        }
+        Ok(())
+    }
+
+    pub fn due_schedules(&self, now: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id FROM task_schedules WHERE start_at <= ?1 AND error IS NULL
+             ORDER BY start_at, task_id",
+        )?;
+        let ids = stmt
+            .query_map([now], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    pub fn schedule_is_due(&self, id: &str, now: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_schedules
+             WHERE task_id = ?1 AND start_at <= ?2 AND error IS NULL)",
+            params![id, now],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn has_pending_schedules(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_schedules WHERE error IS NULL)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn fail_schedule(&self, id: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE task_schedules SET error = ?2 WHERE task_id = ?1",
+            params![id, error],
+        )?;
+        Ok(())
     }
 
     /// Return every task, ordered by `created_at`.
@@ -327,8 +464,8 @@ impl TaskStore {
             .prepare(
                 "SELECT id, title, description, status, repo_path,
                         worktree_path, branch_name, tmux_session, agent_cli,
-                        created_at, updated_at, is_meta
-                 FROM tasks
+                        created_at, updated_at, is_meta, start_at, launch_config, error
+                 FROM tasks LEFT JOIN task_schedules ON task_id = id
                  ORDER BY created_at",
             )
             .context("failed to prepare list query")?;
@@ -349,6 +486,7 @@ impl TaskStore {
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
                     is_meta: row.get::<_, i32>(11)? != 0,
+                    schedule: read_schedule(row)?,
                 })
             })
             .context("failed to execute list query")?
@@ -375,8 +513,8 @@ impl TaskStore {
             .prepare(
                 "SELECT id, title, description, status, repo_path,
                         worktree_path, branch_name, tmux_session, agent_cli,
-                        created_at, updated_at, is_meta
-                 FROM tasks
+                        created_at, updated_at, is_meta, start_at, launch_config, error
+                 FROM tasks LEFT JOIN task_schedules ON task_id = id
                 WHERE id LIKE ?1 ESCAPE '\\'",
             )
             .context("failed to prepare get query")?;
@@ -397,6 +535,7 @@ impl TaskStore {
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
                     is_meta: row.get::<_, i32>(11)? != 0,
+                    schedule: read_schedule(row)?,
                 })
             })
             .context("failed to execute get query")?
@@ -481,7 +620,7 @@ impl TaskStore {
     }
 
     /// Update the user-editable fields of a task: title, description, repo_path.
-    /// Only allowed for Backlog tasks (enforced by callers).
+    /// Only allowed while the task is in Backlog.
     pub fn update_task_details(
         &self,
         id: &str,
@@ -489,6 +628,7 @@ impl TaskStore {
         description: &str,
         repo_path: &str,
     ) -> Result<()> {
+        let repo_path = std::path::absolute(repo_path)?;
         let now = chrono::Utc::now().to_rfc3339();
         let rows = self
             .conn
@@ -498,14 +638,50 @@ impl TaskStore {
                      description = ?2,
                      repo_path   = ?3,
                      updated_at  = ?4
-                 WHERE id = ?5",
-                params![title, description, repo_path, now, id],
+                 WHERE id = ?5 AND status = 'Backlog'",
+                params![title, description, repo_path.to_string_lossy(), now, id],
             )
             .context("failed to update task details")?;
 
         if rows == 0 {
-            return Err(anyhow!("no task found with id '{}'", id));
+            return Err(anyhow!(
+                "Only backlog tasks can edit details or working directory"
+            ));
         }
+        Ok(())
+    }
+
+    /// Save the form as one update relative to task launch. An absent schedule
+    /// change preserves the original launch profile and any launch error.
+    pub fn update_backlog_task(
+        &self,
+        id: &str,
+        title: &str,
+        description: &str,
+        repo_path: &str,
+        is_meta: bool,
+        schedule_change: Option<Option<&Schedule>>,
+    ) -> Result<()> {
+        let transaction = self.launch_transaction()?;
+        self.update_task_details(id, title, description, repo_path)?;
+        self.conn.execute(
+            "UPDATE tasks SET is_meta = ?1 WHERE id = ?2",
+            params![is_meta, id],
+        )?;
+        if let Some(schedule) = schedule_change {
+            self.write_schedule(id, schedule)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_task_title(&self, id: &str, title: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = self.conn.execute(
+            "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            params![title, now, id],
+        )?;
+        anyhow::ensure!(changed == 1, "No task found with id '{id}'");
         Ok(())
     }
 
@@ -539,11 +715,17 @@ impl TaskStore {
             ],
         )
         .context("failed to queue task cleanup")?;
+        // A scheduled launch might have attached a session since the UI checked the task.
         let rows = tx
-            .execute("DELETE FROM tasks WHERE id = ?1", params![task.id])
+            .execute(
+                "DELETE FROM tasks WHERE id = ?1 AND updated_at = ?2",
+                params![task.id, task.updated_at],
+            )
             .context("failed to delete task")?;
         if rows == 0 {
-            return Err(anyhow!("no task found with id '{}'", task.id));
+            return Err(anyhow!(
+                "Task changed during deletion. Refresh and try again."
+            ));
         }
         tx.commit().context("failed to commit task deletion")?;
         Ok(())

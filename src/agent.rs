@@ -138,6 +138,10 @@ fn format_command(cfg: &config::EffectiveConfig, resume: bool, prompt: Option<&s
     parts.join(" ")
 }
 
+pub fn scheduled_command(cfg: &config::EffectiveConfig, prompt: &str) -> String {
+    wrap_with_exit_marker(&format_command(cfg, false, Some(prompt)))
+}
+
 fn configured_command(agent: &str, resume: bool, prompt: Option<&str>) -> String {
     format_command(&resolve_config(agent), resume, prompt)
 }

@@ -187,20 +187,22 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
         if event::poll(Duration::from_millis(200)).context("event poll failed")? {
             match event::read().context("event read failed")? {
                 Event::Paste(text) => match &app.input_mode {
-                    InputMode::NewTask { .. } => keys::handle_new_task_paste(app, &text),
+                    InputMode::TaskForm { .. } => keys::handle_task_form_paste(app, &text),
                     InputMode::EditTask { .. } => keys::handle_edit_task_paste(app, &text),
+                    InputMode::ScheduleTask { .. } => keys::handle_schedule_paste(app, &text),
                     _ => {}
                 },
                 Event::Key(key) if key.kind == KeyEventKind::Press => match &app.input_mode {
                     InputMode::Normal => {
                         keys::handle_normal_key(terminal, app, key.code)?;
                     }
-                    InputMode::NewTask { .. } => {
-                        keys::handle_new_task_key(app, key)?;
+                    InputMode::TaskForm { .. } => {
+                        keys::handle_task_form_key(app, key)?;
                     }
                     InputMode::EditTask { .. } => {
                         keys::handle_edit_task_key(app, key)?;
                     }
+                    InputMode::ScheduleTask { .. } => keys::handle_schedule_key(app, key.code)?,
                     InputMode::SendMessage { .. } => {
                         keys::handle_send_message_key(app, key.code)?;
                     }

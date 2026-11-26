@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod orchestrator;
 mod prompts;
+mod schedule;
 mod setup;
 mod skills;
 mod store;
@@ -68,26 +69,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if matches!(
-        &cli.command,
-        Commands::Board { .. } | Commands::Start { .. }
-    ) {
-        let cfg = config::load()?;
-        let effective = config::effective(&cfg, None)?;
-        if !config::program_available(&effective.program) {
-            let config_path = config::path()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "your user configuration file".to_owned());
-            anyhow::bail!(
-                "Configured agent CLI '{}' (agent '{}') was not found on PATH. Install it, make sure it is executable, or update '{}' ([agents.{}.program]). Currently supported CLIs are kiro-cli, codex, and copilot.",
-                effective.program,
-                effective.agent,
-                config_path,
-                effective.agent
-            );
-        }
-    }
-
     let store = TaskStore::open()?;
 
     match cli.command {
@@ -97,30 +78,56 @@ fn main() -> Result<()> {
             working_directory,
             description,
             meta,
+            at,
         } => {
             let desc = description.as_deref().unwrap_or(&title);
-            let task = if meta {
-                let workspace = match working_directory {
-                    Some(path) => path,
-                    None => orchestrator::suggested_meta_workspace()?,
-                };
-                store.create_task_with_meta(&title, desc, &workspace, true)?
-            } else {
-                let working_directory = working_directory.unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .expect("Failed to get current directory")
-                        .to_string_lossy()
-                        .to_string()
-                });
-                store.create_task(&title, desc, &working_directory)?
+            let workspace = match working_directory {
+                Some(path) => path,
+                None if meta => orchestrator::suggested_meta_workspace()?,
+                None => std::env::current_dir()?.to_string_lossy().into_owned(),
             };
+            let schedule = schedule::prepare(at.as_deref().unwrap_or_default())?;
+            let task = store.create_scheduled_task(&title, desc, &workspace, meta, schedule)?;
             println!("Created task: {} ({})", task.title, &task.id[..8]);
+            if let Some(schedule) = task.schedule {
+                println!(
+                    "Starts {} · {} / {}",
+                    schedule::display(schedule.at),
+                    schedule.config.agent,
+                    schedule.config.profile
+                );
+            }
         }
+        Commands::Schedule { task_id, at, clear } => {
+            let task = store.get_task(&task_id)?;
+            anyhow::ensure!(
+                task.status == store::TaskStatus::Backlog,
+                "Only backlog tasks can be scheduled"
+            );
+            if clear {
+                store.set_schedule(&task.id, None)?;
+                println!("Cleared scheduled start for {}", &task.id[..8]);
+            } else {
+                let schedule = schedule::prepare(at.as_deref().unwrap_or_default())?
+                    .ok_or_else(|| anyhow::anyhow!("Specify a future start time"))?;
+                store.set_schedule(&task.id, Some(&schedule))?;
+                println!(
+                    "Starts {} · {} / {}",
+                    schedule::display(schedule.at),
+                    schedule.config.agent,
+                    schedule.config.profile
+                );
+            }
+        }
+        Commands::Scheduler { once } => schedule::run(&store, once)?,
         Commands::Start {
             task_id,
             skip_setup,
         } => {
             let task = store.get_task(&task_id)?;
+            if task.schedule.is_none() {
+                check_agent_program()?;
+            }
             let updated = orchestrator::start_task_with_options(&store, &task, skip_setup)?;
             println!(
                 "Started task {} in tmux session '{}'",
@@ -158,7 +165,11 @@ fn main() -> Result<()> {
                 println!(
                     "{:<10} {:<12} {:<40} {}",
                     short_id,
-                    task.status.to_string(),
+                    match &task.schedule {
+                        Some(schedule) if schedule.error.is_some() => "Start failed".into(),
+                        Some(_) => "Scheduled".into(),
+                        None => task.status.to_string(),
+                    },
                     title,
                     task.repo_path
                 );
@@ -189,6 +200,12 @@ fn main() -> Result<()> {
             tmux::attach_session(session)?;
         }
         Commands::Board { repo } => {
+            if store.has_pending_schedules()? {
+                if let Err(error) = schedule::ensure_worker() {
+                    eprintln!("Could not restart scheduler: {error:#}");
+                }
+            }
+            check_agent_program()?;
             // Resolve repo path to absolute if provided
             let repo_filter = repo.map(|r| {
                 std::path::Path::new(&r)
@@ -210,6 +227,17 @@ fn main() -> Result<()> {
             println!("Task: {}", task.title);
             println!("ID: {}", task.id);
             println!("Status: {}", task.status);
+            if let Some(schedule) = &task.schedule {
+                println!(
+                    "Scheduled start: {} · {} / {}",
+                    schedule::display(schedule.at),
+                    schedule.config.agent,
+                    schedule.config.profile
+                );
+                if let Some(error) = &schedule.error {
+                    println!("Scheduled launch failed: {error}");
+                }
+            }
             println!(
                 "Agent: {}",
                 task.agent_cli.as_deref().unwrap_or("not started")
@@ -277,5 +305,23 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn check_agent_program() -> Result<()> {
+    let cfg = config::load()?;
+    let effective = config::effective(&cfg, None)?;
+    if !config::program_available(&effective.program) {
+        let config_path = config::path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "your user configuration file".to_owned());
+        anyhow::bail!(
+                "Configured agent CLI '{}' (agent '{}') was not found on PATH. Install it, make sure it is executable, or update '{}' ([agents.{}.program]). Currently supported CLIs are kiro-cli, codex, and copilot.",
+                effective.program,
+                effective.agent,
+                config_path,
+                effective.agent
+            );
+    }
     Ok(())
 }
