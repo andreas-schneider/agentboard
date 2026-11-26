@@ -19,11 +19,8 @@ pub const QUICK_PROMPTS: &[QuickPrompt] = &[
     QuickPrompt {
         key: '2',
         label: "Commit, push & PR",
-        prompt: "Commit all your changes with a clear, conventional commit message. \
-                 Choose a descriptive branch name matching the work done if not already \
-                 on one. Push the branch and create a pull request (or update it if one \
-                 already exists). Write a PR description summarizing the changes, \
-                 motivation, and what was tested.",
+        prompt: "commit to well named branch and create brief PR (motivation, what was \
+                 changed, how it was changed, design / architectural changes if applicable.",
     },
     QuickPrompt {
         key: '3',
