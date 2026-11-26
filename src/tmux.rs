@@ -47,11 +47,13 @@ pub fn create_session(session: &str, working_dir: &str) -> Result<()> {
     // Wait for the shell inside the new pane to be ready. We poll the
     // visible pane content until a shell prompt appears — that means the
     // shell has fully initialised and is ready to accept send-keys input.
-    wait_for_shell_ready(&agent_target(session))?;
-    create_shell_window(session, working_dir)?;
-    configure_agentboard_bindings()?;
-
-    Ok(())
+    let result = wait_for_shell_ready(&agent_target(session))
+        .and_then(|()| create_shell_window(session, working_dir))
+        .and_then(|()| configure_agentboard_bindings());
+    if result.is_err() {
+        let _ = kill_session(session);
+    }
+    result
 }
 
 /// Poll until the tmux pane shows a shell prompt, indicating the shell has
@@ -325,7 +327,7 @@ pub fn attach_session_with_poll(session: &str, mut poll: impl FnMut()) -> Result
 /// being installed or permission issues.
 pub fn kill_session(session: &str) -> Result<()> {
     let output = Command::new("tmux")
-        .args(["kill-session", "-t", session])
+        .args(["kill-session", "-t", &format!("={session}")])
         .output()
         .context("failed to spawn tmux kill-session")?;
 
@@ -351,7 +353,7 @@ pub fn kill_session(session: &str) -> Result<()> {
 /// Check whether a tmux session exists.
 pub fn session_exists(session: &str) -> bool {
     Command::new("tmux")
-        .args(["has-session", "-t", session])
+        .args(["has-session", "-t", &format!("={session}")])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

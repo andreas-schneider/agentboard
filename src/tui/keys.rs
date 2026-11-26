@@ -9,6 +9,7 @@ use ratatui::Terminal;
 
 use crate::orchestrator;
 use crate::prompts::QUICK_PROMPTS;
+use crate::schedule;
 use crate::store::TaskStatus;
 use crate::tmux;
 
@@ -202,6 +203,23 @@ pub fn handle_normal_key(
             app.notify(Notification::info("Refreshed"));
         }
 
+        KeyCode::Char('t') => {
+            if let Some(task) = app
+                .selected_task()
+                .filter(|task| task.status == TaskStatus::Backlog)
+            {
+                let value = schedule_input(
+                    task.schedule
+                        .as_ref()
+                        .filter(|schedule| schedule.error.is_none()),
+                );
+                app.input_mode = InputMode::ScheduleTask {
+                    task_id: task.id.clone(),
+                    field: schedule_field(value),
+                };
+            }
+        }
+
         // New task (multi-field form)
         KeyCode::Char('n') => {
             let default_repo = match &app.repo_filter {
@@ -211,7 +229,8 @@ pub fn handle_normal_key(
                     .unwrap_or_default(),
             };
             let default_repo_len = default_repo.len();
-            app.input_mode = InputMode::NewTask {
+            app.input_mode = InputMode::TaskForm {
+                editing: None,
                 fields: vec![
                     InputField {
                         label: "Title",
@@ -231,6 +250,7 @@ pub fn handle_normal_key(
                         placeholder: "Detailed prompt for the agent (optional)",
                         cursor_pos: 0,
                     },
+                    schedule_field(String::new()),
                 ],
                 active_field: 0,
                 is_meta: false,
@@ -294,10 +314,10 @@ pub fn handle_normal_key(
                 // safe to edit. Once a task has started, its working directory
                 // and initial prompt (Details) are already consumed, so we only
                 // allow renaming the task.
-                let fields = if task.status == TaskStatus::Backlog {
+                if task.status == TaskStatus::Backlog {
                     let repo_len = task.repo_path.len();
                     let desc_len = task.description.len();
-                    vec![
+                    let fields = vec![
                         InputField {
                             label: "Title",
                             value: task.title.clone(),
@@ -316,20 +336,27 @@ pub fn handle_normal_key(
                             placeholder: "Detailed prompt for the agent (optional)",
                             cursor_pos: desc_len,
                         },
-                    ]
+                        schedule_field(schedule_input(task.schedule.as_ref())),
+                    ];
+                    app.input_mode = InputMode::TaskForm {
+                        editing: Some((task.id, task.schedule)),
+                        fields,
+                        active_field: 0,
+                        is_meta: task.is_meta,
+                        previous_working_directory: None,
+                    };
                 } else {
-                    vec![InputField {
-                        label: "Title",
-                        value: task.title.clone(),
-                        placeholder: "Short task description",
-                        cursor_pos: title_len,
-                    }]
-                };
-                app.input_mode = InputMode::EditTask {
-                    task_id: task.id.clone(),
-                    fields,
-                    active_field: 0,
-                };
+                    app.input_mode = InputMode::EditTask {
+                        task_id: task.id,
+                        fields: vec![InputField {
+                            label: "Title",
+                            value: task.title,
+                            placeholder: "Short task description",
+                            cursor_pos: title_len,
+                        }],
+                        active_field: 0,
+                    };
+                }
             }
         }
 
@@ -372,17 +399,87 @@ pub fn handle_normal_key(
 }
 
 // ---------------------------------------------------------------------------
-// New task form
+// Create or edit a backlog task
 // ---------------------------------------------------------------------------
 
-pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
+pub(super) fn schedule_input(schedule: Option<&schedule::Schedule>) -> String {
+    schedule
+        .and_then(|schedule| chrono::DateTime::from_timestamp(schedule.at, 0))
+        .map(|at| at.with_timezone(&chrono::Local).to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn schedule_field(value: String) -> InputField {
+    InputField {
+        label: "Schedule start (optional)",
+        cursor_pos: value.len(),
+        value,
+        placeholder: schedule::PLACEHOLDER,
+    }
+}
+
+fn handle_schedule_field(field: &mut InputField, code: KeyCode) {
+    match code {
+        KeyCode::F(key @ 1..=3) => {
+            field.value = schedule::QUICK_PICKS[usize::from(key - 1)].to_owned();
+            field.cursor_pos = field.value.len();
+        }
+        KeyCode::F(4) => {
+            field.value.clear();
+            field.cursor_pos = 0;
+        }
+        _ => handle_field_key(field, code),
+    }
+}
+
+pub fn handle_schedule_paste(app: &mut App, text: &str) {
+    if let InputMode::ScheduleTask { field, .. } = &mut app.input_mode {
+        handle_field_paste(field, text);
+    }
+}
+
+pub fn handle_schedule_key(app: &mut App, code: KeyCode) -> Result<()> {
+    let InputMode::ScheduleTask { task_id, field } = &mut app.input_mode else {
+        return Ok(());
+    };
+    match code {
+        KeyCode::Esc => app.input_mode = InputMode::Normal,
+        KeyCode::Enter | KeyCode::F(4) => {
+            let result = if code == KeyCode::F(4) {
+                Ok(None)
+            } else if field.value.trim().is_empty() {
+                Err(anyhow::anyhow!("Enter a start time or press F4 to clear"))
+            } else {
+                schedule::prepare(&field.value)
+            };
+            match result.and_then(|schedule| {
+                app.store.set_schedule(task_id, schedule.as_ref())?;
+                Ok(schedule)
+            }) {
+                Ok(schedule) => {
+                    app.input_mode = InputMode::Normal;
+                    app.refresh_now()?;
+                    let message = schedule.map_or_else(
+                        || "Scheduled start cleared".into(),
+                        |schedule| format!("Starts {}", schedule::display(schedule.at)),
+                    );
+                    app.notify(Notification::info(message));
+                }
+                Err(error) => app.notify(Notification::warn(format!("{error:#}"))),
+            }
+        }
+        _ => handle_schedule_field(field, code),
+    }
+    Ok(())
+}
+
+pub fn handle_task_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
-            // Closing the New Task dialog now auto-saves the task (no separate save key).
-            submit_new_task(app)?;
+            submit_task_form(app)?;
         }
         KeyCode::Tab | KeyCode::Down => {
-            if let InputMode::NewTask {
+            if let InputMode::TaskForm {
                 ref fields,
                 ref mut active_field,
                 ..
@@ -393,7 +490,7 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::BackTab | KeyCode::Up => {
-            if let InputMode::NewTask {
+            if let InputMode::TaskForm {
                 ref fields,
                 ref mut active_field,
                 ..
@@ -409,20 +506,20 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // Ctrl+S has its own terminal control sequence, unlike Ctrl+Enter,
         // which many terminals encode as an ordinary Enter.
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            submit_new_task(app)?;
+            submit_task_form(app)?;
         }
-        KeyCode::Enter if new_task_toggle_is_active(app) => app.toggle_new_task_meta()?,
-        KeyCode::Char(' ') if new_task_toggle_is_active(app) => app.toggle_new_task_meta()?,
+        KeyCode::Enter if task_form_toggle_is_active(app) => app.toggle_task_form_meta()?,
+        KeyCode::Char(' ') if task_form_toggle_is_active(app) => app.toggle_task_form_meta()?,
         // Enter only submits when the dialog as a whole is active. If a single
         // non-Details field is active, move focus forward instead. Enter in
         // Details inserts a newline so multi-line input works as expected.
-        KeyCode::Enter if new_task_dialog_is_active(app) => submit_new_task(app)?,
+        KeyCode::Enter if task_form_dialog_is_active(app) => submit_task_form(app)?,
         // Some terminals or multiplexers do not pass bracketed-paste
         // sequences through. Treat a plain Enter in Details as text so a
         // multi-line paste can never create a task mid-paste. For other
         // single-line fields, treat Enter like Tab (advance focus).
         KeyCode::Enter => {
-            if let InputMode::NewTask {
+            if let InputMode::TaskForm {
                 ref mut fields,
                 ref mut active_field,
                 ..
@@ -439,14 +536,18 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         _ => {
-            if let InputMode::NewTask {
+            if let InputMode::TaskForm {
                 ref mut fields,
                 active_field,
                 ..
             } = app.input_mode
             {
                 if active_field < fields.len() {
-                    handle_field_key(&mut fields[active_field], key.code);
+                    if active_field == 3 {
+                        handle_schedule_field(&mut fields[active_field], key.code);
+                    } else {
+                        handle_field_key(&mut fields[active_field], key.code);
+                    }
                 }
             }
         }
@@ -454,12 +555,12 @@ pub fn handle_new_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// Insert a terminal paste into the active New Task form field.
+/// Insert a terminal paste into the active task form field.
 ///
 /// Bracketed paste delivers embedded newlines as text rather than `Enter` key
 /// events, so pasting a multi-line prompt cannot submit the form.
-pub fn handle_new_task_paste(app: &mut App, text: &str) {
-    if let InputMode::NewTask {
+pub fn handle_task_form_paste(app: &mut App, text: &str) {
+    if let InputMode::TaskForm {
         ref mut fields,
         active_field,
         ..
@@ -471,10 +572,10 @@ pub fn handle_new_task_paste(app: &mut App, text: &str) {
     }
 }
 
-fn new_task_toggle_is_active(app: &App) -> bool {
+fn task_form_toggle_is_active(app: &App) -> bool {
     matches!(
         &app.input_mode,
-        InputMode::NewTask {
+        InputMode::TaskForm {
             fields,
             active_field,
             ..
@@ -483,10 +584,10 @@ fn new_task_toggle_is_active(app: &App) -> bool {
 }
 
 /// Dialog-level focus: when the active_field is one past the toggle index.
-fn new_task_dialog_is_active(app: &App) -> bool {
+fn task_form_dialog_is_active(app: &App) -> bool {
     matches!(
         &app.input_mode,
-        InputMode::NewTask {
+        InputMode::TaskForm {
             fields,
             active_field,
             ..
@@ -494,8 +595,9 @@ fn new_task_dialog_is_active(app: &App) -> bool {
     )
 }
 
-fn submit_new_task(app: &mut App) -> Result<()> {
-    if let InputMode::NewTask {
+fn submit_task_form(app: &mut App) -> Result<()> {
+    if let InputMode::TaskForm {
+        ref editing,
         ref fields,
         is_meta,
         ..
@@ -505,21 +607,47 @@ fn submit_new_task(app: &mut App) -> Result<()> {
         let repo = fields[1].value.trim().to_string();
         let description = fields[2].value.trim().to_string();
         if title.is_empty() {
-            if description.is_empty() {
+            if editing.is_none() && description.is_empty() {
                 app.input_mode = InputMode::Normal;
             } else {
                 app.notify(Notification::warn("Title cannot be empty"));
             }
-        } else {
-            app.input_mode = InputMode::Normal;
-            app.create_new_task(&title, &description, &repo, is_meta)?;
+            return Ok(());
         }
+        let input = fields[3].value.trim();
+        let schedule_change = if editing
+            .as_ref()
+            .is_some_and(|(_, original)| input == schedule_input(original.as_ref()))
+        {
+            None
+        } else {
+            match schedule::prepare(input) {
+                Ok(schedule) => Some(schedule),
+                Err(error) => {
+                    app.notify(Notification::warn(format!("{error:#}")));
+                    return Ok(());
+                }
+            }
+        };
+        if let Some((id, _)) = editing {
+            let id = id.clone();
+            app.edit_backlog_task(&id, &title, &description, &repo, is_meta, schedule_change)?;
+        } else {
+            app.create_new_task(
+                &title,
+                &description,
+                &repo,
+                is_meta,
+                schedule_change.flatten(),
+            )?;
+        }
+        app.input_mode = InputMode::Normal;
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Edit task form (same field navigation as new task, but saves to existing)
+// Title-only edit for tasks outside the backlog
 // ---------------------------------------------------------------------------
 
 pub fn handle_edit_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -554,20 +682,14 @@ pub fn handle_edit_task_key(app: &mut App, key: KeyEvent) -> Result<()> {
             submit_edit_task(app)?;
         }
         KeyCode::Enter if edit_task_dialog_is_active(app) => submit_edit_task(app)?,
-        // Match New Task: Enter advances from a single-line field and inserts
-        // a newline in Details, including for unbracketed multi-line pastes.
         KeyCode::Enter => {
             if let InputMode::EditTask {
-                ref mut fields,
-                ref mut active_field,
+                fields,
+                active_field,
                 ..
-            } = app.input_mode
+            } = &mut app.input_mode
             {
-                if *active_field == 2 && *active_field < fields.len() {
-                    handle_field_paste(&mut fields[*active_field], "\n");
-                } else {
-                    *active_field = (*active_field + 1) % (fields.len() + 1);
-                }
+                *active_field = fields.len();
             }
         }
         _ => {
@@ -616,22 +738,11 @@ fn submit_edit_task(app: &mut App) -> Result<()> {
     {
         let task_id = task_id.clone();
         let title = fields[0].value.trim().to_string();
-        // Started tasks show a title-only form; fall back to the task's
-        // existing working directory and details so they are preserved.
-        let existing = app.tasks.iter().find(|t| t.id == task_id);
-        let repo = match fields.get(1) {
-            Some(field) => field.value.trim().to_string(),
-            None => existing.map(|t| t.repo_path.clone()).unwrap_or_default(),
-        };
-        let description = match fields.get(2) {
-            Some(field) => field.value.trim().to_string(),
-            None => existing.map(|t| t.description.clone()).unwrap_or_default(),
-        };
         if title.is_empty() {
             app.notify(Notification::warn("Title cannot be empty"));
         } else {
             app.input_mode = InputMode::Normal;
-            app.edit_task(&task_id, &title, &description, &repo)?;
+            app.edit_task(&task_id, &title)?;
         }
     }
     Ok(())
@@ -910,7 +1021,7 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
 mod tests {
     use super::{
         handle_confirm_key, handle_edit_task_key, handle_field_paste, handle_lane_config_key,
-        handle_new_task_key,
+        handle_task_form_key,
     };
     use crate::store::{TaskStatus, TaskStore};
     use crate::tui::app::{App, InputField, InputMode, PendingAction};
@@ -955,7 +1066,8 @@ mod tests {
     fn submitting_empty_new_task_closes_form_without_creating_task() {
         let store = TaskStore::open_in_memory().unwrap();
         let mut app = App::new(store, None).unwrap();
-        app.input_mode = InputMode::NewTask {
+        app.input_mode = InputMode::TaskForm {
+            editing: None,
             fields: vec![
                 InputField {
                     label: "Title",
@@ -981,7 +1093,7 @@ mod tests {
             previous_working_directory: None,
         };
 
-        handle_new_task_key(
+        handle_task_form_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
         )
@@ -994,12 +1106,28 @@ mod tests {
     #[test]
     fn edit_task_enter_navigates_and_esc_saves() {
         let store = TaskStore::open_in_memory().unwrap();
+        let schedule = crate::schedule::Schedule {
+            at: 1,
+            config: crate::config::EffectiveConfig {
+                agent: "codex".into(),
+                profile: "saved-profile".into(),
+                program: "codex".into(),
+                args: vec![],
+                resume_args: vec![],
+            },
+            error: None,
+        };
         let task = store
-            .create_task("Old", "Old details", "/tmp/repo")
+            .create_scheduled_task("Old", "Old details", "/tmp/repo", true, Some(schedule))
             .unwrap();
+        store.fail_schedule(&task.id, "failed launch").unwrap();
+        let original = store.get_task(&task.id).unwrap().schedule;
+        let schedule_field = super::schedule_field(super::schedule_input(original.as_ref()));
         let mut app = App::new(store, None).unwrap();
-        app.input_mode = InputMode::EditTask {
-            task_id: task.id.clone(),
+        app.input_mode = InputMode::TaskForm {
+            editing: Some((task.id.clone(), original)),
+            is_meta: true,
+            previous_working_directory: None,
             fields: vec![
                 InputField {
                     label: "Title",
@@ -1019,24 +1147,25 @@ mod tests {
                     placeholder: "",
                     cursor_pos: 8,
                 },
+                schedule_field,
             ],
             active_field: 0,
         };
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_edit_task_key(&mut app, enter).unwrap();
+        handle_task_form_key(&mut app, enter).unwrap();
         assert!(matches!(
             app.input_mode,
-            InputMode::EditTask {
+            InputMode::TaskForm {
                 active_field: 1,
                 ..
             }
         ));
         assert_eq!(app.store.get_task(&task.id).unwrap().title, "Old");
 
-        handle_edit_task_key(&mut app, enter).unwrap();
-        handle_edit_task_key(&mut app, enter).unwrap();
-        let InputMode::EditTask {
+        handle_task_form_key(&mut app, enter).unwrap();
+        handle_task_form_key(&mut app, enter).unwrap();
+        let InputMode::TaskForm {
             fields,
             active_field,
             ..
@@ -1047,11 +1176,37 @@ mod tests {
         assert_eq!(*active_field, 2);
         assert_eq!(fields[2].value, "Line one\n");
 
-        handle_edit_task_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_task_form_key(&mut app, tab).unwrap();
+        handle_task_form_key(&mut app, tab).unwrap();
+        handle_task_form_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_task_form_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(matches!(app.input_mode, InputMode::Normal));
         let saved = app.store.get_task(&task.id).unwrap();
         assert_eq!(saved.title, "New");
         assert_eq!(saved.description, "Line one");
+        assert_eq!(saved.repo_path, "/tmp/repo");
+        assert!(!saved.is_meta);
+        let schedule = saved.schedule.unwrap();
+        assert_eq!(schedule.at, 1);
+        assert_eq!(schedule.config.profile, "saved-profile");
+        assert_eq!(schedule.error.as_deref(), Some("failed launch"));
+
+        app.store
+            .update_backlog_task(
+                &task.id,
+                &saved.title,
+                &saved.description,
+                &saved.repo_path,
+                false,
+                Some(None),
+            )
+            .unwrap();
+        assert!(app.store.get_task(&task.id).unwrap().schedule.is_none());
     }
 
     #[test]

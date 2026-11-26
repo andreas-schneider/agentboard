@@ -16,7 +16,8 @@
 | Key | Action |
 |-----|--------|
 | `Enter` | Start (backlog) / Attach or auto-resume (running/blocked/review/done/keep) |
-| `s` | Start selected backlog task |
+| `s` | Start selected backlog task now or retry a failed scheduled start |
+| `t` | Schedule or reschedule the selected backlog task |
 | `e` | Edit backlog task (title, description, working directory) |
 | `m` | Send a message to an agent (running/blocked) |
 | `p` | Open the quick prompts palette |
@@ -53,7 +54,7 @@ restarted with `R`.
 | `?` | Show the help overlay |
 | `q`/`Esc` | Quit |
 
-While creating a task, `Tab`/arrow keys navigate through the fields and the
+When creating or editing a backlog task, `Tab`/arrow keys navigate through the fields and the
 optional Meta task toggle. Press `Enter` or `Space` when the toggle is focused
 to activate it. Meta tasks add Agentboard board/task-management context. Their
 Working directory defaults to a generated Agentboard meta-workspace but remains
@@ -62,6 +63,20 @@ editable; a Git directory still uses a task worktree.
 Creating and editing use the same form keys: `Enter` advances from a single-line
 field, adds a newline in Details, and saves when the form itself is focused.
 `Esc` or `Ctrl+S` saves from any field. `Tab` and arrow keys move between fields.
+
+## Scheduled starts
+
+Press `t` on a backlog task or use the **Schedule start** field in the create or
+edit form. To clear it from the form, focus the field and press `F4`, then save. Press `F1`, `F2`, or `F3` for 30 minutes, 2 hours, or tomorrow at 09:00.
+For a custom time, enter a local date and time such as `2027-02-15 09:00` or
+an ISO timestamp with an offset. The preview shows the resolved time, agent,
+and execution profile. In the scheduling dialog, press `Enter` to save,
+`F4` to clear the schedule, or `Esc` to cancel.
+
+Scheduled tasks remain in Backlog until they start in a detached tmux session.
+The task details show launch failures so you can retry them with `s` or
+reschedule with `t`. See [Scheduled starts in the CLI](CLI.md#scheduled-starts)
+for background scheduler behavior.
 
 ## Attached agent sessions
 

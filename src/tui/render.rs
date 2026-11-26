@@ -49,8 +49,9 @@ pub fn ui(frame: &mut Frame, app: &App) {
     }
 
     match &app.input_mode {
-        InputMode::NewTask { .. } => render_new_task_form(frame, app, size),
+        InputMode::TaskForm { .. } => render_task_form(frame, app, size),
         InputMode::EditTask { .. } => render_edit_task_form(frame, app, size),
+        InputMode::ScheduleTask { field, .. } => render_schedule_dialog(frame, field, size),
         InputMode::SendMessage { .. } => render_send_message(frame, app, size),
         InputMode::Confirm { .. } => render_confirm_dialog(frame, app, size),
         InputMode::QuickPrompts => render_quick_prompts(frame, app, size),
@@ -249,6 +250,18 @@ fn render_columns(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray)
                 };
 
+                let subtitle = match &task.schedule {
+                    Some(schedule) if schedule.error.is_some() => "Scheduled start failed".into(),
+                    Some(schedule) => chrono::DateTime::from_timestamp(schedule.at, 0)
+                        .map(|at| {
+                            format!(
+                                "Starts {}",
+                                at.with_timezone(&chrono::Local).format("%m-%d %H:%M")
+                            )
+                        })
+                        .unwrap_or_else(|| "Scheduled start".into()),
+                    None => format!("[{short_id}]"),
+                };
                 let lines = vec![
                     Line::from(vec![
                         Span::styled(title_display, style),
@@ -257,7 +270,7 @@ fn render_columns(frame: &mut Frame, app: &App, area: Rect) {
                             Style::default().fg(Color::Green),
                         ),
                     ]),
-                    Line::from(Span::styled(format!("[{}]", short_id), id_style)),
+                    Line::from(Span::styled(subtitle, id_style)),
                 ];
 
                 ListItem::new(lines)
@@ -300,7 +313,10 @@ fn render_detail_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     // Split inner area: metadata (top) | live preview (bottom)
     let detail_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(if task.schedule.is_some() { 11 } else { 9 }),
+            Constraint::Min(0),
+        ])
         .split(inner);
 
     // -- Metadata section --
@@ -371,6 +387,21 @@ fn render_detail_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(wt_display, Style::default().fg(Color::White)),
         ]));
+    }
+
+    if let Some(schedule) = &task.schedule {
+        meta_lines.push(Line::from(format!(
+            "Starts {} · {} / {}",
+            crate::schedule::display(schedule.at),
+            schedule.config.agent,
+            schedule.config.profile
+        )));
+        if let Some(error) = &schedule.error {
+            meta_lines.push(Line::from(Span::styled(
+                format!("Start failed: {error}"),
+                Style::default().fg(Color::LightRed),
+            )));
+        }
     }
 
     // Time info
@@ -549,6 +580,10 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::raw("Start selected backlog task"),
         ]),
         Line::from(vec![
+            Span::styled("  t           ", Style::default().fg(Color::Cyan)),
+            Span::raw("Schedule or reschedule a backlog task"),
+        ]),
+        Line::from(vec![
             Span::styled("  e           ", Style::default().fg(Color::Cyan)),
             Span::raw("Edit task (title; all fields for Backlog)"),
         ]),
@@ -648,56 +683,119 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
 // New task form overlay
 // ---------------------------------------------------------------------------
 
-fn render_new_task_form(frame: &mut Frame, app: &App, area: Rect) {
-    let overlay = centered_rect(60, 60, area);
+fn render_task_form(frame: &mut Frame, app: &App, area: Rect) {
+    let InputMode::TaskForm {
+        editing,
+        fields,
+        active_field,
+        is_meta,
+        ..
+    } = &app.input_mode
+    else {
+        return;
+    };
+    let (title, color) = if editing.is_some() {
+        (
+            " Edit Task (Enter: next/save, Esc/Ctrl+S: save) ",
+            Color::Cyan,
+        )
+    } else {
+        (
+            " New Task (Enter: next/save, Esc/Ctrl+S: save) ",
+            Color::Yellow,
+        )
+    };
+    let overlay = centered_rect(80, 90, area);
     frame.render_widget(Clear, overlay);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(color))
         .title(Span::styled(
-            " New Task (Enter: next/save, Esc/Ctrl+S: save) ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(overlay);
     frame.render_widget(block, overlay);
 
-    if let InputMode::NewTask {
-        ref fields,
-        active_field,
-        is_meta,
-        ..
-    } = app.input_mode
-    {
-        let toggle_active = active_field == fields.len();
-        let fields_area = Rect {
-            height: inner.height.saturating_sub(2),
-            ..inner
-        };
-        render_task_form_fields(frame, fields, active_field, fields_area);
-        let toggle = if is_meta {
-            "[x] Meta task — adds Agentboard board/task context"
+    let toggle_active = *active_field == fields.len();
+    let fields_area = Rect {
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    render_task_form_fields(frame, fields, *active_field, fields_area);
+    let toggle = if *is_meta {
+        "[x] Meta task — adds Agentboard board/task context"
+    } else {
+        "[ ] Meta task — adds Agentboard board/task context"
+    };
+    frame.render_widget(
+        Paragraph::new(toggle).style(Style::default().fg(if toggle_active {
+            Color::Cyan
+        } else if *is_meta {
+            Color::Yellow
         } else {
-            "[ ] Meta task — adds Agentboard board/task context"
-        };
-        frame.render_widget(
-            Paragraph::new(toggle).style(Style::default().fg(if toggle_active {
-                Color::Cyan
-            } else if is_meta {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            })),
-            Rect {
-                y: inner.y + inner.height.saturating_sub(2),
-                height: 1,
-                ..inner
-            },
-        );
-    }
+            Color::DarkGray
+        })),
+        Rect {
+            y: inner.y + inner.height.saturating_sub(3),
+            height: 1,
+            ..inner
+        },
+    );
+    let field = &fields[3];
+    let original = editing.as_ref().and_then(|(_, schedule)| schedule.as_ref());
+    let original = original
+        .filter(|schedule| field.value.trim() == super::keys::schedule_input(Some(schedule)));
+    render_schedule_hint(
+        frame,
+        field,
+        original,
+        Rect {
+            y: inner.y + inner.height.saturating_sub(2),
+            height: inner.height.min(2),
+            ..inner
+        },
+    );
+}
+
+fn render_schedule_dialog(frame: &mut Frame, field: &InputField, area: Rect) {
+    let area = centered_rect(86, 45, area);
+    let block = Block::bordered().title(" Schedule start · Enter save · F4 clear · Esc cancel ");
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(inner);
+    render_task_form_fields(frame, std::slice::from_ref(field), 0, chunks[0]);
+    render_schedule_hint(frame, field, None, chunks[1]);
+}
+
+fn render_schedule_hint(
+    frame: &mut Frame,
+    field: &InputField,
+    original: Option<&crate::schedule::Schedule>,
+    area: Rect,
+) {
+    let preview = if let Some(schedule) = original {
+        format!(
+            "{} · {} / {}",
+            crate::schedule::display(schedule.at),
+            schedule.config.agent,
+            schedule.config.profile,
+        )
+    } else if field.value.trim().is_empty() {
+        crate::schedule::PLACEHOLDER.to_owned()
+    } else {
+        crate::schedule::preview(&field.value).unwrap_or_else(|error| error.to_string())
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("F1 in 30 min · F2 in 2 hours · F3 tomorrow at 09:00 · F4 clear"),
+            Line::from(preview),
+        ]),
+        area,
+    );
 }
 
 /// Word-wrap `text` to `width` columns.
@@ -810,13 +908,22 @@ fn render_task_form_fields(
     active_field: usize,
     inner: Rect,
 ) {
-    // Title and Working directory get a fixed single-line height; Details gets remaining space.
-    let constraints = vec![
-        Constraint::Length(3), // Title
-        Constraint::Length(3), // Working directory
-        Constraint::Min(5),    // Details — taller, with word-wrap
-        Constraint::Length(0), // absorb any leftover
-    ];
+    let constraints = fields
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            if index == 2 {
+                Constraint::Min(3)
+            } else {
+                Constraint::Length(3)
+            }
+        })
+        .chain([if fields.len() > 1 {
+            Constraint::Length(0)
+        } else {
+            Constraint::Min(0)
+        }])
+        .collect::<Vec<_>>();
     let field_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -944,7 +1051,7 @@ fn render_task_form_fields(
 }
 
 // ---------------------------------------------------------------------------
-// Edit task form overlay (same layout as new task, different title/color)
+// Title-only edit overlay
 // ---------------------------------------------------------------------------
 
 fn render_edit_task_form(frame: &mut Frame, app: &App, area: Rect) {

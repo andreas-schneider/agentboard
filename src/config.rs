@@ -85,7 +85,7 @@ pub struct AgentOptions {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EffectiveConfig {
     pub agent: String,
     pub profile: String,
